@@ -808,13 +808,11 @@ def uses_chat_completions_tool_schema(model_name: str, settings: Settings) -> bo
     """Return whether the resolved SDK route can only receive JSON function tools."""
     if codex.subscription_model(model_name):
         return False
-    if settings.llm.api_type == "chat_completions":
-        return True
-    if settings.llm.api_type == "responses":
-        return False
     model = model_name.strip().lower()
     if "/" in model and not model.startswith("openai/"):
         return True
+    if settings.llm.api_type is not None:
+        return settings.llm.api_type == "chat_completions"
     if settings.llm.api_base:
         return True
     return not model_supports_reasoning(model_name)

@@ -184,6 +184,8 @@ def test_api_type_override_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("STRIX_LLM", "openai/gpt-4")
     monkeypatch.setenv("STRIX_API_TYPE", "responses")
     assert uses_chat_completions_tool_schema("openai/gpt-4", Settings()) is False
+    monkeypatch.setenv("STRIX_LLM", "anthropic/claude-sonnet-4-5")
+    assert uses_chat_completions_tool_schema("anthropic/claude-sonnet-4-5", Settings()) is True
 
 
 @pytest.mark.parametrize(
