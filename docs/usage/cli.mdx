@@ -155,16 +155,6 @@ strix --target ./my-project --workspace-file ./wordlist.txt
 strix --target https://app.com --workspace-file ./openapi.yaml:specs/openapi.yaml
 ```
 
-## Reviewing Findings In The Terminal
-
-In the interactive terminal UI, press **F2** to open findings, then **f** to mark one as a false positive, **r** to reopen it, or **u** to undo a recent change. You can also click **False positive (f)** in the finding detail. The native form accepts an optional reason and note of up to 2,000 characters. In the finding detail or focused findings panel, press **v** to cycle **Open / Closed / All**. The same actions are available through focusable buttons; **Tab / Shift+Tab** moves focus, **Enter** activates a button, and **Esc** goes back. **c** still copies the finding, and **Ctrl+O** opens the optional web viewer.
-
-Triage applies to one finding in one run and is saved in the run's `triage.json`. It survives restarts and scan resume, and is visible in the terminal and [local web viewer](/usage/viewer#marking-false-positives). Closing preserves the finding's severity and evidence. A new scan has its own review state; material changes to a closed finding show **Needs review** and return it to the Open filter while preserving the previous decision. The original scan artifacts and emailed **Original scan report** PDF retain all detected findings and exclude subsequent local triage.
-
-Closing and reopening work with telemetry disabled. When enabled, the existing telemetry setting permits an asynchronous, best-effort classification event containing only the interface, status/resolution transition, reason category, severity, CWE, CVE presence, scan mode, and common system/version information. Written notes, finding content, targets, run and finding IDs, and local digests are excluded. Actions taken with telemetry disabled are not sent later. Set `STRIX_TELEMETRY=0` before starting Strix to opt out.
-
-Triage decisions do not change the original scan's exit code, completion status, or coverage assessment.
-
 ## Exit Codes
 
 | Code | Meaning |
