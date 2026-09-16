@@ -17,13 +17,30 @@ We collect only very **basic** usage data including:
 **Scan Context:** Scan mode (quick/standard/deep), scan type (whitebox/blackbox)\
 **Model Usage:** Which LLM model is being used and whether it runs via an API key or a model subscription (not prompts or responses)\
 **Feature Usage:** Which built-in skills were used during a scan (reported once, at scan end)\
-**Aggregate Metrics:** Vulnerability counts by severity and weakness category (CWE)
+**Aggregate Metrics:** Vulnerability counts by severity and weakness category (CWE)\
+**Finding Triage:** Saved classification changes from the local web viewer and terminal UI, as described below
+
+### False-Positive Triage
+
+Closing a finding as a false positive and reopening it work locally whether telemetry is enabled or disabled. Classification changes include closing, reopening, a changed reason category, or a fresh review after evidence changes. When enabled, a successfully saved classification change can emit `finding_triage_changed` with:
+
+- Source interface: `viewer` or `tui`
+- Previous and new status and resolution, plus an optional predefined reason category (`reason_code`)
+- Finding severity, weakness category (CWE), and whether a CVE is present
+- Scan mode and the common Strix/Python version, OS, and architecture properties
+
+The event uses the existing random process-only session identifier. It excludes notes, titles, descriptions, evidence, proof-of-concept scripts, code, targets, URLs, paths, email addresses, run names, finding IDs, and local finding digests. Freeform text is never included; categories are validated against a fixed vocabulary.
+
+Events are emitted after the local decision is saved and sent asynchronously on a best-effort basis. Delivery may be dropped when the process exits or the in-memory queue is full. Delivery failure does not affect the saved decision. Failed changes, repeated no-op submissions, reading a run, and notes-only edits do not emit classification events. There is no persisted analytics backlog, and enabling telemetry later does not replay actions taken while it was disabled.
+
+These events describe user-reported classification trends, not an independently verified scanner false-positive rate. They do not provide persistent user or finding tracking across processes.
 
 ### What We **Never** Collect
 
 - Usernames, or any identifying information
 - Scan targets, file paths, target URLs, or domains
-- Vulnerability details, descriptions, or code
+- Vulnerability details, descriptions, code, or written triage notes
+- Finding IDs, run names, or local finding digests
 - LLM requests and responses
 
 ### How to Opt Out

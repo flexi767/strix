@@ -22,7 +22,7 @@ const SEV = [
 function SeverityChips({ counts }: { counts: RunSeverityCounts }) {
   const shown = SEV.filter((s) => counts[s.key] > 0);
   if (shown.length === 0) {
-    return <span className="text-xs text-[#555]">No findings</span>;
+    return <span className="text-xs text-[#888]">No open findings</span>;
   }
   return (
     <div className="flex items-center gap-3">
@@ -164,6 +164,7 @@ export default function PastRunsView({
                 {date && <span>{date}</span>}
                 {date && run.status && <span className="text-[#333]">·</span>}
                 {run.status && <span className="capitalize">{run.status}</span>}
+                {run.open_count !== undefined && <span>· {run.open_count} open · {run.closed_count ?? 0} false positives · {run.detected_count ?? run.open_count} found</span>}
               </div>
             </div>
             <SeverityChips counts={run.severity_counts} />
