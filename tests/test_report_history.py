@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import subprocess
+import tempfile
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import pytest
 from agents.tool_context import ToolContext
 
 from strix.core.repository_history import BlameInfo
+from strix.interface.scan_setup import build_targets_info, prepare_run
 from strix.report import history
 from strix.report.history import enrich_report
 from strix.report.state import ReportState, set_global_report_state
@@ -19,13 +23,13 @@ from strix.tools.reporting.tool import create_vulnerability_report, update_vulne
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
-    from pathlib import Path
 
 
 _ANALYSIS = "The query interpolates attacker-controlled input."
 _TARGET = "https://example.test/team/application.git"
 _FIRST_AUTHOR = "Alice Original"
 _LATEST_AUTHOR = "Bea Reviewer"
+_LOCAL_AUTHOR = "Carol Local"
 _CVSS = {
     "attack_vector": "N",
     "attack_complexity": "L",
@@ -57,13 +61,13 @@ def _git(path: Path, *args: str, author: str = _FIRST_AUTHOR) -> str:
     return result.stdout.strip()
 
 
-@pytest.fixture
-def history_run(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> Iterator[tuple[ReportState, Path, dict[str, str]]]:
-    """Use an existing full clone, including an older author for the range start."""
-    monkeypatch.chdir(tmp_path)
-    origin = tmp_path / "origin"
+@pytest.fixture(autouse=True)
+def _isolate_git_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+
+
+def _seed_repository(origin: Path) -> dict[str, str]:
     origin.mkdir()
     _git(origin, "init", "--quiet")
     (origin / "app.py").write_text("query = 'initial'\nresult = query\n", encoding="utf-8")
@@ -72,7 +76,17 @@ def history_run(
     first_sha = _git(origin, "rev-parse", "HEAD")
     (origin / "app.py").write_text("query = 'initial'\nresult = execute(query)\n", encoding="utf-8")
     _git(origin, "commit", "--quiet", "-am", "Execute the query", author=_LATEST_AUTHOR)
-    latest_sha = _git(origin, "rev-parse", "HEAD")
+    return {"first": first_sha, "latest": _git(origin, "rev-parse", "HEAD")}
+
+
+@pytest.fixture
+def history_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[tuple[ReportState, Path, dict[str, str]]]:
+    """Use an existing full clone, including an older author for the range start."""
+    monkeypatch.chdir(tmp_path)
+    origin = tmp_path / "origin"
+    commits = _seed_repository(origin)
     clone = tmp_path / "application"
     _git(tmp_path, "clone", "--quiet", "--no-hardlinks", str(origin), str(clone))
     assert _git(clone, "rev-parse", "--is-shallow-repository") == "false"
@@ -96,19 +110,75 @@ def history_run(
     )
     set_global_report_state(state)
     try:
-        yield state, clone, {"first": first_sha, "latest": latest_sha}
+        yield state, clone, commits
+    finally:
+        set_global_report_state(None)
+
+
+@pytest.fixture
+def scan_setup_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[tuple[ReportState, dict[str, str], dict[str, str]]]:
+    """Build the run the way the CLI does: target inference, cloning, local sources."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "tmp"))
+    commits = _seed_repository(tmp_path / "origin.git")
+    repo_target = (tmp_path / "origin.git").as_uri()
+    local = tmp_path / "service"
+    local.mkdir()
+    _git(local, "init", "--quiet")
+    (local / "app.py").write_text("token = request.args['token']\n", encoding="utf-8")
+    _git(local, "add", "app.py")
+    _git(local, "commit", "--quiet", "-m", "Read the token", author=_LOCAL_AUTHOR)
+
+    args = argparse.Namespace(
+        target=[str(local), repo_target],
+        target_list=None,
+        resume=None,
+        scan_mode="quick",
+        scope_mode="full",
+        diff_base=None,
+        non_interactive=True,
+        instruction="",
+        user_instruction=None,
+        workspace_mount=None,
+        workspace_files=[],
+    )
+    build_targets_info(args)
+    prepare_run(args)
+    clone = Path(args.targets_info[1]["details"]["cloned_repo_path"])
+    assert clone.is_relative_to(tmp_path / "tmp")
+
+    state = ReportState(args.run_name)
+    state.hydrate_from_run_dir()
+    state.set_scan_config(
+        {
+            "targets": args.targets_info,
+            "local_sources": args.local_sources,
+            "run_name": args.run_name,
+            "scope_mode": args.scope_mode,
+            "non_interactive": True,
+        }
+    )
+    set_global_report_state(state)
+    try:
+        yield (
+            state,
+            {"local": str(local.resolve()), "repository": repo_target},
+            {**commits, "local": _git(local, "rev-parse", "HEAD")},
+        )
     finally:
         set_global_report_state(None)
 
 
 async def _create(
-    location: dict[str, Any], *additional_locations: dict[str, Any]
+    location: dict[str, Any], *additional_locations: dict[str, Any], target: str = _TARGET
 ) -> dict[str, Any]:
     arguments = {
         "title": "SQL injection in the query handler",
         "description": "The query handler executes unsanitized input.",
         "impact": "An anonymous caller can access other users' records.",
-        "target": _TARGET,
+        "target": target,
         "technical_analysis": _ANALYSIS,
         "poc_description": "Submit a quote in the query parameter.",
         "poc_script_code": "GET /query?q='",
@@ -343,6 +413,35 @@ def test_unmatched_target_can_use_only_configured_repository(
     enrich_report(report, state.run_record)
 
     assert commits["first"] in report["technical_analysis"]
+
+
+@pytest.mark.parametrize("alias", ["local", "repository", "workspace", "unmatched"])
+async def test_cli_scan_setup_wires_local_and_cloned_targets_into_history(
+    scan_setup_run: tuple[ReportState, dict[str, str], dict[str, str]], alias: str
+) -> None:
+    state, targets, commits = scan_setup_run
+    target = {
+        "local": targets["local"],
+        "repository": targets["repository"],
+        "workspace": "/workspace/origin",
+        "unmatched": "https://example.test/service",
+    }[alias]
+
+    result = await _create({"file": "app.py", "start_line": 1, "end_line": 1}, target=target)
+
+    assert result["success"] is True
+    analysis = state.vulnerability_reports[0]["technical_analysis"]
+    if alias == "local":
+        assert _LOCAL_AUTHOR in analysis
+        assert commits["local"] in analysis
+    elif alias in {"repository", "workspace"}:
+        assert _FIRST_AUTHOR in analysis
+        assert commits["first"] in analysis
+        assert commits["local"] not in analysis
+    else:
+        assert analysis == _ANALYSIS
+    saved = json.loads((state.get_run_dir() / "vulnerabilities.json").read_text())
+    assert saved == state.vulnerability_reports
 
 
 @pytest.mark.parametrize("first_lookup_succeeds", [True, False])
