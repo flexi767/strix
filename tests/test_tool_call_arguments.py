@@ -25,6 +25,7 @@ from openai.types.responses import ResponseFunctionToolCall
 from strix.config.models import _NonStreamingModel, _TurnGuardModel
 from strix.config.tool_call_arguments import (
     MALFORMED_ARGUMENTS_KEY,
+    describe_malformed_arguments,
     repair_arguments,
     repair_history_arguments,
     repair_input,
@@ -244,3 +245,17 @@ def test_repair_input_returns_same_object_when_nothing_changes() -> None:
 
     assert repair_input(items) is items
     assert repair_input("plain prompt") == "plain prompt"
+
+
+@pytest.mark.parametrize("arguments", ['{"cmd": "ls -la', "[1, 2]", "null", "not json"])
+def test_describe_malformed_arguments_tells_the_model_to_reissue(arguments: str) -> None:
+    message = describe_malformed_arguments("exec_command", arguments)
+
+    assert message is not None
+    assert message.startswith("exec_command: the tool call was not executed")
+    assert "Re-issue the call" in message
+
+
+@pytest.mark.parametrize("arguments", ["", "   ", "{}", '{"cmd": "ls"}'])
+def test_describe_malformed_arguments_accepts_objects_and_empty_input(arguments: str) -> None:
+    assert describe_malformed_arguments("exec_command", arguments) is None

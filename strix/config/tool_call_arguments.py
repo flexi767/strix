@@ -22,6 +22,31 @@ from openai.types.responses import ResponseFunctionToolCall
 MALFORMED_ARGUMENTS_KEY = "malformed_arguments"
 
 
+def describe_malformed_arguments(tool_name: str, arguments: str) -> str | None:
+    """Return a model-facing recovery message if ``arguments`` is not a JSON object.
+
+    A tool call whose arguments do not parse is almost always one the stream cut
+    off (the server flushed a prefix of the JSON, or the client closed early),
+    so instead of the SDK's generic parse-error result the model is told the
+    call never ran and must be re-issued whole.
+    """
+    if not arguments.strip():
+        return None
+    try:
+        parsed = json.loads(arguments)
+    except ValueError as exc:
+        detail = str(exc)
+    else:
+        if isinstance(parsed, dict):
+            return None
+        detail = f"expected a JSON object, got {type(parsed).__name__}"
+    return (
+        f"{tool_name}: the tool call was not executed because its arguments were "
+        f"truncated or otherwise not valid JSON ({detail}). The response was likely "
+        "cut off mid-call. Re-issue the call with complete, valid JSON arguments."
+    )
+
+
 def repair_arguments(arguments: object) -> str | None:
     """Return replacement arguments a strict server accepts, or ``None`` if already valid."""
     if not isinstance(arguments, str) or not arguments.strip():
