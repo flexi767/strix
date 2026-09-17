@@ -6,6 +6,7 @@ import html
 import logging
 import re
 from pathlib import Path
+from time import monotonic
 from typing import Any
 
 from strix.core.repository_history import blame_line
@@ -14,6 +15,7 @@ from strix.core.repository_history import blame_line
 logger = logging.getLogger(__name__)
 _START = "<!-- strix:repository-history -->"
 _END = "<!-- /strix:repository-history -->"
+_ENRICHMENT_TIMEOUT = 3.0
 
 
 def _text(value: str) -> str:
@@ -48,7 +50,10 @@ def _repositories(run_record: dict[str, Any], target: str | None) -> list[Path]:
             f"/workspace/{details.get('workspace_subdir')}",
         ):
             matched.add(root)
-    return sorted(matched or roots)
+    # File existence cannot identify the repository for an unmatched target.
+    # Fall back only when the scan itself has exactly one possible checkout.
+    selected = matched or roots
+    return sorted(selected) if len(selected) == 1 else []
 
 
 def _location_line(location: dict[str, Any]) -> int | None:
@@ -65,11 +70,12 @@ def _location_line(location: dict[str, Any]) -> int | None:
 def enrich_report(report: dict[str, Any], run_record: dict[str, Any]) -> None:
     """Refresh blame for the current locations, never failing a report operation.
 
-    No new checkout is made. Ambiguous paths across multiple repositories are
-    omitted unless the finding's target identifies its repository. Markers let
+    No new checkout is made. Multiple repositories require a uniquely matching
+    target. A shared time budget bounds all lookups in a report. Markers let
     revisions and resumed scans replace only the generated part of the analysis.
     """
     try:
+        deadline = monotonic() + _ENRICHMENT_TIMEOUT
         analysis = re.sub(
             re.escape(_START) + r".*?" + re.escape(_END),
             "",
@@ -82,9 +88,13 @@ def enrich_report(report: dict[str, Any], run_record: dict[str, Any]) -> None:
         if not locations:
             return
         roots = _repositories(run_record, report.get("target"))
+        if not roots:
+            return
         entries: list[str] = []
         seen: set[tuple[str, int]] = set()
         for location in locations:
+            if monotonic() >= deadline:
+                break
             file_path = location.get("file")
             line = _location_line(location)
             if not isinstance(file_path, str) or line is None or (file_path, line) in seen:
@@ -93,7 +103,10 @@ def enrich_report(report: dict[str, Any], run_record: dict[str, Any]) -> None:
             candidates = [root for root in roots if (root / file_path).is_file()]
             if len(candidates) != 1:
                 continue
-            info = blame_line(candidates[0], file_path, line)
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                break
+            info = blame_line(candidates[0], file_path, line, timeout=remaining)
             if info is None:
                 continue
             entries.append(

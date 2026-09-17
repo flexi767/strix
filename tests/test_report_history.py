@@ -10,6 +10,8 @@ from typing import TYPE_CHECKING, Any
 import pytest
 from agents.tool_context import ToolContext
 
+from strix.core.repository_history import BlameInfo
+from strix.report import history
 from strix.report.history import enrich_report
 from strix.report.state import ReportState, set_global_report_state
 from strix.tools.reporting.tool import create_vulnerability_report, update_vulnerability_report
@@ -99,7 +101,9 @@ def history_run(
         set_global_report_state(None)
 
 
-async def _create(location: dict[str, Any]) -> dict[str, Any]:
+async def _create(
+    location: dict[str, Any], *additional_locations: dict[str, Any]
+) -> dict[str, Any]:
     arguments = {
         "title": "SQL injection in the query handler",
         "description": "The query handler executes unsanitized input.",
@@ -116,7 +120,7 @@ async def _create(location: dict[str, Any]) -> dict[str, Any]:
         "severity_change_conditions": "A read-only database role would limit the impact.",
         "fix_effort": "low",
         "cvss_breakdown": _CVSS,
-        "code_locations": [location],
+        "code_locations": [location, *additional_locations],
     }
     context = ToolContext(
         context={"agent_id": "root"},
@@ -246,7 +250,7 @@ async def test_unexpected_history_failure_does_not_block_reporting(
 ) -> None:
     state, _clone, _commits = history_run
 
-    def broken_blame(*_args: Any) -> None:
+    def broken_blame(*_args: Any, **_kwargs: Any) -> None:
         raise RuntimeError("history lookup failed")
 
     monkeypatch.setattr("strix.report.history.blame_line", broken_blame)
@@ -282,3 +286,133 @@ def test_ambiguous_repository_requires_matching_target_and_target_updates_refres
     assert "Other Author" in report["technical_analysis"]
     assert commits["first"] not in report["technical_analysis"]
     assert report["technical_analysis"].count("Last modified by") == 1
+
+
+@pytest.mark.parametrize("target", [None, "https://example.test/query", "query handler"])
+def test_unmatched_target_cannot_select_repository_by_unique_file(
+    history_run: tuple[ReportState, Path, dict[str, str]], tmp_path: Path, target: str | None
+) -> None:
+    state, _clone, _commits = history_run
+    other = tmp_path / "other"
+    other.mkdir()
+    state.run_record["local_sources"].append(
+        {"source_path": str(other), "workspace_subdir": "other"}
+    )
+    report = {
+        "target": target,
+        "technical_analysis": _ANALYSIS,
+        "code_locations": [{"file": "app.py", "start_line": 1, "end_line": 1}],
+    }
+
+    enrich_report(report, state.run_record)
+
+    assert report["technical_analysis"] == _ANALYSIS
+
+
+@pytest.mark.parametrize("target", ["application", "/workspace/application"])
+def test_colliding_workspace_alias_cannot_select_repository_by_unique_file(
+    history_run: tuple[ReportState, Path, dict[str, str]], tmp_path: Path, target: str
+) -> None:
+    state, _clone, _commits = history_run
+    other = tmp_path / "other"
+    other.mkdir()
+    state.run_record["local_sources"].append(
+        {"source_path": str(other), "workspace_subdir": "application"}
+    )
+    report = {
+        "target": target,
+        "technical_analysis": _ANALYSIS,
+        "code_locations": [{"file": "app.py", "start_line": 1, "end_line": 1}],
+    }
+
+    enrich_report(report, state.run_record)
+
+    assert report["technical_analysis"] == _ANALYSIS
+
+
+def test_unmatched_target_can_use_only_configured_repository(
+    history_run: tuple[ReportState, Path, dict[str, str]],
+) -> None:
+    state, _clone, commits = history_run
+    report = {
+        "target": "https://example.test/query",
+        "technical_analysis": _ANALYSIS,
+        "code_locations": [{"file": "app.py", "start_line": 1, "end_line": 1}],
+    }
+
+    enrich_report(report, state.run_record)
+
+    assert commits["first"] in report["technical_analysis"]
+
+
+@pytest.mark.parametrize("first_lookup_succeeds", [True, False])
+async def test_history_budget_is_shared_and_partial_results_are_persisted(
+    history_run: tuple[ReportState, Path, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+    first_lookup_succeeds: bool,
+) -> None:
+    state, _clone, commits = history_run
+    clock = [0.0]
+    timeouts: list[float] = []
+    info = BlameInfo(
+        author_name=_FIRST_AUTHOR,
+        author_email="author@example.test",
+        commit_sha=commits["first"],
+        commit_timestamp="2024-01-02T03:04:05+00:00",
+        commit_summary="Add query handler",
+    )
+
+    def slow_blame(*_args: Any, timeout: float) -> BlameInfo | None:
+        timeouts.append(timeout)
+        clock[0] += min(1.0 if len(timeouts) == 1 else 3.0, timeout)
+        return info if first_lookup_succeeds and len(timeouts) == 1 else None
+
+    monkeypatch.setattr(history, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(history, "blame_line", slow_blame)
+
+    result = await _create(
+        {"file": "app.py", "start_line": 1, "end_line": 1},
+        {"file": "app.py", "start_line": 2, "end_line": 2},
+        {"file": "app.py", "start_line": 999, "end_line": 999},
+    )
+
+    assert result["success"] is True
+    assert timeouts == pytest.approx([3.0, 2.0])
+    assert clock[0] == pytest.approx(3.0)
+    report = state.vulnerability_reports[0]
+    analysis = report["technical_analysis"]
+    if first_lookup_succeeds:
+        assert commits["first"] in analysis
+        assert "**app.py:1**" in analysis
+        assert "**app.py:2**" not in analysis
+    else:
+        assert analysis == _ANALYSIS
+    saved = json.loads((state.get_run_dir() / "vulnerabilities.json").read_text())
+    assert saved == [report]
+    markdown = (state.get_run_dir() / "vulnerabilities" / f"{report['id']}.md").read_text()
+    assert analysis in markdown
+
+
+def test_invalid_locations_still_consume_shared_history_budget(
+    history_run: tuple[ReportState, Path, dict[str, str]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state, _clone, _commits = history_run
+    clock = [0.0]
+    location_line = history._location_line
+
+    def slow_location_line(location: dict[str, Any]) -> int | None:
+        clock[0] += 0.5
+        return location_line(location)
+
+    monkeypatch.setattr(history, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(history, "_location_line", slow_location_line)
+    report = {
+        "target": _TARGET,
+        "technical_analysis": _ANALYSIS,
+        "code_locations": [{"file": "app.py"} for _ in range(20)],
+    }
+
+    enrich_report(report, state.run_record)
+
+    assert clock[0] <= 3.0
+    assert report["technical_analysis"] == _ANALYSIS

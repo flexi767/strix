@@ -49,14 +49,23 @@ def _parse_blame(output: str) -> BlameInfo | None:
         return None
 
 
-def blame_line(repository: Path, file_path: object, line: int) -> BlameInfo | None:
+def blame_line(
+    repository: Path, file_path: object, line: int, *, timeout: float = 3.0
+) -> BlameInfo | None:
     """Attribute one working-tree line, or return None when history is unavailable.
 
     Paths are relative to ``repository``. Git follows committed renames itself;
     missing paths, binary files and uncommitted lines are intentionally omitted.
     Lookups never fetch history and are bounded so enrichment stays optional.
+    Callers may supply a shorter timeout to share a budget across lookups.
     """
-    if type(line) is not int or line < 1 or not isinstance(file_path, str) or not file_path:
+    if (
+        type(line) is not int
+        or line < 1
+        or not isinstance(file_path, str)
+        or not file_path
+        or timeout <= 0
+    ):
         return None
     try:
         relative = Path(file_path)
@@ -87,7 +96,7 @@ def blame_line(repository: Path, file_path: object, line: int) -> BlameInfo | No
             encoding="utf-8",
             errors="replace",
             check=False,
-            timeout=3,
+            timeout=min(timeout, 3.0),
             env={**os.environ, "GIT_NO_LAZY_FETCH": "1"},
         )
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):

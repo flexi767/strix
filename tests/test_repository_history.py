@@ -196,3 +196,22 @@ def test_nonzero_exit_is_skipped_and_git_is_local_bounded(repository: Path) -> N
     assert kwargs["timeout"] <= 3
     assert kwargs["env"]["GIT_NO_LAZY_FETCH"] == "1"
     assert "--no-textconv" in args[0]
+
+
+@pytest.mark.parametrize(("timeout", "expected"), [(0.25, 0.25), (1.5, 1.5), (30, 3)])
+def test_blame_timeout_respects_remaining_budget_and_per_lookup_limit(
+    repository: Path, timeout: float, expected: float
+) -> None:
+    result = subprocess.CompletedProcess(["git"], 128, stdout="", stderr="fatal")
+    with patch("strix.core.repository_history.subprocess.run", return_value=result) as run:
+        assert blame_line(repository, "vulnerable.py", 2, timeout=timeout) is None
+
+    assert run.call_args.kwargs["timeout"] == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("timeout", [0, -1])
+def test_expired_blame_budget_does_not_start_git(repository: Path, timeout: float) -> None:
+    with patch("strix.core.repository_history.subprocess.run") as run:
+        assert blame_line(repository, "vulnerable.py", 2, timeout=timeout) is None
+
+    run.assert_not_called()
