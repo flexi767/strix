@@ -43,6 +43,7 @@ _CODE_LOCATION_FIELDS = (
     "file",
     "start_line",
     "end_line",
+    "primary_line",
     "snippet",
     "label",
     "fix_before",
@@ -73,7 +74,9 @@ def _normalize_code_locations(
             if field not in loc or loc[field] is None:
                 continue
             value = loc[field]
-            if field in ("start_line", "end_line"):
+            if field in ("start_line", "end_line", "primary_line"):
+                if isinstance(value, (bool, float)):
+                    continue
                 try:
                     normalized[field] = int(value)
                 except (TypeError, ValueError):
@@ -1123,7 +1126,9 @@ async def create_vulnerability_report(
             but unverified follow-on risks separate; do not use them to
             set CVSS metrics.
         target: Affected URL / domain / repository.
-        technical_analysis: The mechanism and root cause.
+        technical_analysis: The mechanism and root cause. When local repository
+            history is available, the report automatically appends "Last modified
+            by" details for the code locations. Do not invent attribution.
         poc_description: Step-by-step reproduction (steps only, no code).
         poc_script_code: Working PoC (Python preferred).
         remediation_steps: Specific, actionable fix (prose, no code).
@@ -1221,6 +1226,9 @@ async def create_vulnerability_report(
             - ``end_line`` (REQUIRED): 1-based; ``>= start_line``.
               Only equal to ``start_line`` when the block truly is one
               line.
+            - ``primary_line`` (optional): the primary vulnerable line within
+              this range. Local Git blame uses this line, or ``start_line``
+              when omitted or outside the range. History enrichment is best-effort.
             - ``snippet`` (optional): verbatim source at this range.
             - ``label`` (optional): short role description; especially
               important for multi-part fixes.
