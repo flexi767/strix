@@ -261,6 +261,71 @@ def test_corrupt_sidecar_is_a_visible_error_not_empty_findings(viewer: ViewerCli
     assert read_vulnerabilities(viewer.run_dir)[0]["evidence"] == "original evidence"
 
 
+@pytest.mark.parametrize("damage", ["malformed", "null", "schema", "identity", "findings"])
+def test_invalid_historical_run_does_not_break_history(
+    viewer: ViewerClient, monkeypatch: pytest.MonkeyPatch, damage: str
+) -> None:
+    other = viewer.run_dir.parent / "damaged"
+    other.mkdir()
+    (other / "run.json").write_text(
+        json.dumps({"run_name": "damaged", "status": "completed", "end_time": "2026-09-15"}),
+        encoding="utf-8",
+    )
+    (other / "vulnerabilities.json").write_bytes(
+        (viewer.run_dir / "vulnerabilities.json").read_bytes()
+    )
+    finding = read_triaged_vulnerabilities(other)[0]
+    triage_finding(
+        other,
+        finding["id"],
+        status="closed",
+        expected_revision=0,
+        reviewed_digest=finding["finding_digest"],
+        surface="tui",
+    )
+    sidecar = other / "triage.json"
+    document = json.loads(sidecar.read_text(encoding="utf-8"))
+    if damage == "malformed":
+        sidecar.write_text("{", encoding="utf-8")
+    elif damage == "null":
+        sidecar.write_text("null", encoding="utf-8")
+    elif damage == "findings":
+        (other / "vulnerabilities.json").write_text("[null]", encoding="utf-8")
+    else:
+        if damage == "schema":
+            document["schema_version"] = 2
+        else:
+            document["run_identity"]["run_id"] = "another-run"
+        sidecar.write_text(json.dumps(document), encoding="utf-8")
+    saved = sidecar.read_bytes()
+    evidence = (other / "vulnerabilities.json").read_bytes()
+
+    # The locked history must not try to read the damaged run's findings.
+    assert viewer.request("/api/runs") == (200, {"locked": True, "count": 2, "runs": []})
+    monkeypatch.setattr("strix.interface.viewer.auth.is_verified", lambda: True)
+    status, payload = viewer.request("/api/runs")
+    assert status == 200
+    assert payload["count"] == 2
+    runs = {run["name"]: run for run in payload["runs"]}
+    assert runs["example"]["open_count"] == 1
+    assert runs["example"]["severity_counts"]["high"] == 1
+    assert runs["damaged"]["status"] == "completed"
+    assert runs["damaged"]["severity_counts"] is None
+    assert all(
+        key not in runs["damaged"] for key in ("open_count", "closed_count", "detected_count")
+    )
+    assert viewer.finding()["status"] == "open"
+    assert viewer.request("/api/vulnerabilities?run=damaged")[0] == 409
+    body = {
+        "status": "open",
+        "expected_revision": 1,
+        "reviewed_digest": finding["finding_digest"],
+    }
+    assert viewer.request("/api/vulnerabilities/vuln-0001/triage?run=damaged", body)[0] == 409
+    assert sidecar.read_bytes() == saved
+    assert (other / "vulnerabilities.json").read_bytes() == evidence
+
+
 def test_read_only_run_has_no_write_capability(viewer: ViewerClient) -> None:
     viewer.run_dir.chmod(0o500)
     try:

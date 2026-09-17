@@ -109,6 +109,8 @@ def _file_lock(descriptor: int, *, unlock: bool = False) -> None:
     if sys.platform == "win32":
         import msvcrt  # noqa: PLC0415
 
+        # The CRT permits locking beyond EOF, so even an empty file has byte zero
+        # available as a stable lock region. Always unlock that same region.
         os.lseek(descriptor, 0, os.SEEK_SET)
         msvcrt.locking(descriptor, msvcrt.LK_UNLCK if unlock else msvcrt.LK_NBLCK, 1)
     else:

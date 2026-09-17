@@ -71,9 +71,7 @@ def _iter_run_dirs(base_dir: Path) -> list[Path]:
 def run_list_entry(run_dir: Path) -> dict[str, Any]:
     """Compact summary of a single run for the history list."""
     record = read_run_summary(run_dir)
-    findings = read_triaged_vulnerabilities(run_dir)
-    active = [finding for finding in findings if finding.get("status") != "closed"]
-    return {
+    entry = {
         "name": record.get("run_name") or run_dir.name,
         "target": primary_target(record),
         "scan_mode": record.get("scan_mode"),
@@ -81,6 +79,16 @@ def run_list_entry(run_dir: Path) -> dict[str, Any]:
         "start_time": record.get("start_time"),
         "end_time": record.get("end_time"),
         "finished": bool(record.get("finished")),
+    }
+    try:
+        findings = read_triaged_vulnerabilities(run_dir)
+    except TriageError:
+        # Keep the run selectable without claiming its review counts are known.
+        # Its findings endpoint still reports the error and preserves the data.
+        return {**entry, "severity_counts": None}
+    active = [finding for finding in findings if finding.get("status") != "closed"]
+    return {
+        **entry,
         "severity_counts": severity_counts(active),
         "open_count": len(active),
         "closed_count": len(findings) - len(active),

@@ -167,7 +167,11 @@ export default function PastRunsView({
                 {run.open_count !== undefined && <span>· {run.open_count} open · {run.closed_count ?? 0} false positives · {run.detected_count ?? run.open_count} found</span>}
               </div>
             </div>
-            <SeverityChips counts={run.severity_counts} />
+            {run.severity_counts ? (
+              <SeverityChips counts={run.severity_counts} />
+            ) : (
+              <span className="text-xs text-[#888]">Review unavailable</span>
+            )}
             <ChevronRight className="h-4 w-4 flex-shrink-0 text-[#555] transition-colors group-hover:text-[#aaa]" aria-hidden="true" />
           </button>
         );
