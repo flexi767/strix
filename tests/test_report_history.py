@@ -195,6 +195,8 @@ def test_reporting_tools_expose_optional_git_attribution_guidance() -> None:
         "technical_analysis",
         "author-mail",
         "committer-time",
+        "using a tool (e.g. Python",
+        "timezone.utc",
         "summary",
         "all-zero SHAs",
         "errors/timeouts",
@@ -202,6 +204,8 @@ def test_reporting_tools_expose_optional_git_attribution_guidance() -> None:
     ):
         assert instruction in description
     assert "refresh or remove" in update_vulnerability_report.description
+    assert "Before filing a finding" in description
+    assert description.index("Local Git attribution") < description.index("When to file")
 
 
 @pytest.mark.parametrize(

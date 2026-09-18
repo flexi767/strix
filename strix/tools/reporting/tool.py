@@ -927,6 +927,29 @@ async def create_vulnerability_report(
 ) -> str:
     """File a vulnerability report — one report per fully-verified finding.
 
+    **Local Git attribution (best effort)**: for a finding with a repository
+    file and valid line number, use ``exec_command`` in the existing full-clone
+    checkout. Identify the affected repository first; if ambiguous, skip
+    attribution. Blame the primary vulnerable line when known, otherwise the
+    ``start_line`` of the primary code location. Quote paths and use a short
+    timeout, for example::
+
+        GIT_NO_LAZY_FETCH=1 timeout 3s git -C REPO -c safe.directory=REPO \\
+            blame --line-porcelain --no-textconv -L LINE,LINE -- FILE
+
+    Add a **Last modified by** subsection to ``technical_analysis`` with the
+    file/line, author name (``author``), author email (``author-mail``), commit
+    SHA (first field), commit timestamp (``committer-time``, rendered in UTC),
+    and commit summary (``summary``), where available. Convert the Unix timestamp
+    using a tool (e.g. Python ``datetime`` with ``timezone.utc``), never mentally;
+    if conversion fails, keep the observed Unix timestamp. Use only observed
+    output; never invent attribution or imply the author introduced the flaw.
+    Skip all-zero SHAs (uncommitted lines), missing/invalid line numbers,
+    missing or renamed paths you cannot resolve, binary/generated files without
+    useful history, unavailable Git metadata, and command errors/timeouts.
+    Do not clone, fetch, or retry just for attribution; omit it and file the
+    finding normally when unavailable. It must never block scanning or reporting.
+
     **When to file**: you have a concrete vulnerability with a working
     proof-of-concept and you're 100% sure it's a real issue.
 
@@ -1016,27 +1039,6 @@ async def create_vulnerability_report(
     populate ``code_locations``. See the ``code_locations`` arg below
     for the full rules around ``fix_before`` / ``fix_after``,
     multi-part fixes, and informational-vs-actionable entries.
-
-    **Local Git attribution (best effort)**: for a finding with a repository
-    file and valid line number, use ``exec_command`` in the existing full-clone
-    checkout. Identify the affected repository first; if ambiguous, skip
-    attribution. Blame the primary vulnerable line when known, otherwise the
-    ``start_line`` of the primary code location. Quote paths and use a short
-    timeout, for example::
-
-        GIT_NO_LAZY_FETCH=1 timeout 3s git -C REPO blame --line-porcelain \\
-            --no-textconv -L LINE,LINE -- FILE
-
-    Add a **Last modified by** subsection to ``technical_analysis`` with the
-    file/line, author name (``author``), author email (``author-mail``), commit
-    SHA (first field), commit timestamp (``committer-time``, rendered in UTC),
-    and commit summary (``summary``), where available. Use only observed Git
-    output; never invent attribution or imply the author introduced the flaw.
-    Skip all-zero SHAs (uncommitted lines), missing/invalid line numbers,
-    missing or renamed paths you cannot resolve, binary/generated files without
-    useful history, unavailable Git metadata, and command errors/timeouts.
-    Do not clone, fetch, or retry just for attribution; omit it and file the
-    finding normally when unavailable. It must never block scanning or reporting.
 
     **CVSS breakdown** is an object with all 8 metrics (each a single
     uppercase letter):
@@ -1144,8 +1146,13 @@ async def create_vulnerability_report(
             but unverified follow-on risks separate; do not use them to
             set CVSS metrics.
         target: Affected URL / domain / repository.
-        technical_analysis: The mechanism and root cause, including "Last modified
-            by" details when verified using local Git attribution as described above.
+        technical_analysis: The mechanism and root cause. Before filing a finding
+            with code locations, use ``exec_command`` to attempt local ``git blame``
+            on the primary vulnerable line (otherwise ``start_line``) in the correct
+            existing checkout, using the short timeout described above. Include the
+            observed author name/email, full commit SHA, UTC commit timestamp, and
+            summary under **Last modified by** here. If history is unavailable or
+            the command fails, omit attribution and file normally; never invent it.
         poc_description: Step-by-step reproduction (steps only, no code).
         poc_script_code: Working PoC (Python preferred).
         remediation_steps: Specific, actionable fix (prose, no code).
