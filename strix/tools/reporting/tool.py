@@ -43,7 +43,6 @@ _CODE_LOCATION_FIELDS = (
     "file",
     "start_line",
     "end_line",
-    "primary_line",
     "snippet",
     "label",
     "fix_before",
@@ -74,9 +73,7 @@ def _normalize_code_locations(
             if field not in loc or loc[field] is None:
                 continue
             value = loc[field]
-            if field in ("start_line", "end_line", "primary_line"):
-                if isinstance(value, (bool, float)):
-                    continue
+            if field in ("start_line", "end_line"):
                 try:
                     normalized[field] = int(value)
                 except (TypeError, ValueError):
@@ -1020,6 +1017,27 @@ async def create_vulnerability_report(
     for the full rules around ``fix_before`` / ``fix_after``,
     multi-part fixes, and informational-vs-actionable entries.
 
+    **Local Git attribution (best effort)**: for a finding with a repository
+    file and valid line number, use ``exec_command`` in the existing full-clone
+    checkout. Identify the affected repository first; if ambiguous, skip
+    attribution. Blame the primary vulnerable line when known, otherwise the
+    ``start_line`` of the primary code location. Quote paths and use a short
+    timeout, for example::
+
+        GIT_NO_LAZY_FETCH=1 timeout 3s git -C REPO blame --line-porcelain \\
+            --no-textconv -L LINE,LINE -- FILE
+
+    Add a **Last modified by** subsection to ``technical_analysis`` with the
+    file/line, author name (``author``), author email (``author-mail``), commit
+    SHA (first field), commit timestamp (``committer-time``, rendered in UTC),
+    and commit summary (``summary``), where available. Use only observed Git
+    output; never invent attribution or imply the author introduced the flaw.
+    Skip all-zero SHAs (uncommitted lines), missing/invalid line numbers,
+    missing or renamed paths you cannot resolve, binary/generated files without
+    useful history, unavailable Git metadata, and command errors/timeouts.
+    Do not clone, fetch, or retry just for attribution; omit it and file the
+    finding normally when unavailable. It must never block scanning or reporting.
+
     **CVSS breakdown** is an object with all 8 metrics (each a single
     uppercase letter):
 
@@ -1126,9 +1144,8 @@ async def create_vulnerability_report(
             but unverified follow-on risks separate; do not use them to
             set CVSS metrics.
         target: Affected URL / domain / repository.
-        technical_analysis: The mechanism and root cause. When local repository
-            history is available, the report automatically appends "Last modified
-            by" details for the code locations. Do not invent attribution.
+        technical_analysis: The mechanism and root cause, including "Last modified
+            by" details when verified using local Git attribution as described above.
         poc_description: Step-by-step reproduction (steps only, no code).
         poc_script_code: Working PoC (Python preferred).
         remediation_steps: Specific, actionable fix (prose, no code).
@@ -1226,9 +1243,6 @@ async def create_vulnerability_report(
             - ``end_line`` (REQUIRED): 1-based; ``>= start_line``.
               Only equal to ``start_line`` when the block truly is one
               line.
-            - ``primary_line`` (optional): the primary vulnerable line within
-              this range. Local Git blame uses this line, or ``start_line``
-              when omitted or outside the range. History enrichment is best-effort.
             - ``snippet`` (optional): verbatim source at this range.
             - ``label`` (optional): short role description; especially
               important for multi-part fixes.
@@ -1449,6 +1463,8 @@ async def update_vulnerability_report(
       ``severity_change_conditions`` with a new ``cvss_breakdown``.
     - ``code_locations`` replaces the whole list. A location carrying
       ``fix_after`` needs ``fix_verification``.
+    - When changing a target or code location, refresh or remove any "Last modified
+      by" attribution in ``technical_analysis``; do not retain stale Git details.
 
     The report keeps its id, its original author, and its filing time. The
     revision is recorded in the report as update history, so state the

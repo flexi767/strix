@@ -14,7 +14,6 @@ from strix.config import codex
 from strix.config.loader import load_settings
 from strix.core.paths import run_dir_for, runtime_state_dir
 from strix.report.coverage import write_coverage
-from strix.report.history import enrich_report
 from strix.report.pricing import resolve_litellm_model
 from strix.report.sarif import write_sarif
 from strix.report.writer import (
@@ -408,7 +407,6 @@ class ReportState:
         if agent_name:
             report["agent_name"] = agent_name
 
-        enrich_report(report, self.run_record)
         if self.vulnerability_found_callback:
             self.vulnerability_found_callback(report)
 
@@ -497,9 +495,6 @@ class ReportState:
             revised.pop(dependent, None)
         revised["update_history"] = history
         revised["updated_at"] = entry["timestamp"]
-
-        if {"technical_analysis", "code_locations", "target"} & changed.keys():
-            enrich_report(revised, self.run_record)
 
         # Persistence must accept the revision before local state changes. A
         # failed callback leaves the old evidence intact and the update retryable.
