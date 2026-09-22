@@ -614,7 +614,6 @@ def test_litellm_success_carries_sizes_finish_reason_headers_and_details() -> No
         "cache_hit": False,
     }
     assert event.time_to_first_token_ms is None
-    assert event.request_body is None and event.response_body is None
     assert "sk-ant-secret" not in str(event.to_dict())
     assert "SECRET PROMPT" not in str(event.to_dict())
     assert "SECRET COMPLETION" not in str(event.to_dict())
@@ -710,81 +709,10 @@ def test_to_dict_and_log_line_include_new_fields() -> None:
         "finish_reason",
         "response_headers",
         "details",
-        "request_body_truncated",
-        "response_body_truncated",
     ):
         assert key in data
-    assert "request_body" not in data
-    assert "response_body" not in data
     assert "rate_limit" not in data
     assert data["time_to_first_token_ms"] == 100
-
-
-# --------------------------------------------------------------------------- #
-# opt-in raw bodies                                                            #
-# --------------------------------------------------------------------------- #
-
-
-def test_bodies_are_off_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv(request_log.CAPTURE_BODIES_ENV, raising=False)
-    assert request_log.bodies_enabled() is False
-    for value in ("0", "false", "no", "", "maybe"):
-        monkeypatch.setenv(request_log.CAPTURE_BODIES_ENV, value)
-        assert request_log.bodies_enabled() is False
-    for value in ("1", "true", "YES", " on "):
-        monkeypatch.setenv(request_log.CAPTURE_BODIES_ENV, value)
-        assert request_log.bodies_enabled() is True
-
-
-def test_litellm_bodies_captured_only_when_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
-    kwargs = _anthropic_kwargs(None, headers={"request-id": "req_ok"})
-    payload = {
-        "model": "claude-sonnet-4-5",
-        "system": "SYSTEM",
-        "messages": [
-            {"role": "user", "content": "SECRET PROMPT sk-ant-api03-abcdefghijklmnopqrstu"}
-        ],
-    }
-    kwargs["additional_args"] = {"complete_input_dict": payload}
-    kwargs["original_response"] = '{"id":"msg_01abc","content":[{"text":"SECRET COMPLETION"}]}'
-
-    monkeypatch.delenv(request_log.CAPTURE_BODIES_ENV, raising=False)
-    off = request_log.event_from_litellm(kwargs, _FakeResponse(), None, None, outcome="success")
-    assert off.request_body is None and off.response_body is None
-    assert off.has_bodies is False
-
-    monkeypatch.setenv(request_log.CAPTURE_BODIES_ENV, "true")
-    on = request_log.event_from_litellm(kwargs, _FakeResponse(), None, None, outcome="success")
-    assert on.has_bodies is True
-    assert on.request_body is not None and "SECRET PROMPT" in on.request_body
-    assert "sk-ant-api03" not in on.request_body
-    assert on.response_body == kwargs["original_response"]
-    assert on.request_body_truncated is False and on.response_body_truncated is False
-    # The bodies never travel with the row-shaped view or the log line.
-    assert "SECRET PROMPT" not in str(on.to_dict())
-    assert "SECRET COMPLETION" not in str(on.to_dict())
-    assert "SECRET" not in repr(on)
-
-
-def test_litellm_failure_body_is_the_error_body(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv(request_log.CAPTURE_BODIES_ENV, "1")
-    exc = _anthropic_error(400, ANTHROPIC_BLOCK_BODY, {"request-id": "req_b"})
-    kwargs = _anthropic_kwargs(exc)
-    event = request_log.event_from_litellm(kwargs, None, None, None, outcome="error")
-    assert event.response_body is not None
-    assert "content filtering policy" in event.response_body
-    assert event.request_body is not None and "SECRET PROMPT" in event.request_body
-
-
-def test_bodies_are_truncated_at_the_configured_limit(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv(request_log.CAPTURE_BODIES_ENV, "1")
-    monkeypatch.setenv(request_log.BODY_MAX_BYTES_ENV, "64")
-    text, truncated = request_log.body_text({"content": "é" * 500})
-    assert truncated is True
-    assert text is not None and len(text.encode("utf-8")) <= 64
-    monkeypatch.setenv(request_log.BODY_MAX_BYTES_ENV, "not-a-number")
-    assert request_log.body_max_bytes() == request_log.DEFAULT_BODY_MAX_BYTES
-    assert request_log.body_text(None) == (None, False)
 
 
 # --------------------------------------------------------------------------- #
@@ -1031,34 +959,6 @@ async def test_openai_route_success_carries_request_and_response_sizes(
     assert event.details["request"]["tool_count"] == 1
     assert event.details["request"]["input_items"] == 1
     assert event.details["response"]["usage"]["input_tokens"] == 10
-    assert event.request_body is None
-    assert "SYSTEM SECRET INSTRUCTIONS" not in str(event.to_dict())
-
-
-@pytest.mark.asyncio
-async def test_openai_route_bodies_when_enabled(
-    captured: list[LlmRequestEvent], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv(request_log.CAPTURE_BODIES_ENV, "1")
-    created = ResponseCreatedEvent(
-        response=_completed_event("resp_body").response,
-        sequence_number=0,
-        type="response.created",
-    )
-    model = request_log.RequestLoggingModel(
-        _Inner(stream_events=[created, _completed_event("resp_body")]),
-        model_name="gpt-5",
-        provider="openai",
-        base_url=None,
-    )
-    args = list(_CALL_ARGS)
-    args[0] = "SYSTEM SECRET INSTRUCTIONS"
-    async for _ in model.stream_response(*args, **_CALL_KWARGS):
-        pass
-    event = captured[0]
-    assert event.request_body is not None and "SYSTEM SECRET INSTRUCTIONS" in event.request_body
-    assert event.response_body is not None and '"id":"resp_body"' in event.response_body
-    assert event.details is not None and event.details["response"]["id"] == "resp_body"
     assert "SYSTEM SECRET INSTRUCTIONS" not in str(event.to_dict())
 
 

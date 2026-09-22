@@ -13,12 +13,8 @@ the attempt travels free-form: the response headers minus credential-bearing
 names, and a ``details`` object with the request parameters, the full usage
 object, the SDK's hidden parameters and the error body. Content (prompts,
 completions, tool arguments) and credentials are removed from both, values are
-redacted and every string, list and object is bounded.
-
-The raw request and response bodies are captured only when the deployment opts
-in (``STRIX_LLM_REQUEST_LOG_CAPTURE_BODIES``); they never appear in the log
-line or in :meth:`LlmRequestEvent.to_dict`, a persistence sink has to store them
-on purpose.
+redacted and every string, list and object is bounded. Raw request and
+response bodies are never captured.
 
 Sinks are plain callables. The built-in sink writes one log line per event;
 deployments register their own (a database, a queue) with
@@ -32,13 +28,12 @@ import contextlib
 import dataclasses
 import json
 import logging
-import os
 import re
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextvars import ContextVar, Token
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, date, datetime
 from typing import TYPE_CHECKING, Any, Literal, cast
 from urllib.parse import urlsplit
@@ -69,10 +64,6 @@ Outcome = Literal["success", "error"]
 Route = Literal["litellm", "openai"]
 
 ERROR_MESSAGE_MAX_CHARS = 2000
-
-CAPTURE_BODIES_ENV = "STRIX_LLM_REQUEST_LOG_CAPTURE_BODIES"
-BODY_MAX_BYTES_ENV = "STRIX_LLM_REQUEST_LOG_BODY_MAX_BYTES"
-DEFAULT_BODY_MAX_BYTES = 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -123,24 +114,12 @@ class LlmRequestEvent:
     # Free-form: request parameters, full usage object, SDK hidden params,
     # error body ... with content and credentials removed and sizes bounded.
     details: dict[str, Any] | None = None
-    # Opt-in only (STRIX_LLM_REQUEST_LOG_CAPTURE_BODIES). Redacted JSON text.
-    request_body: str | None = field(default=None, repr=False)
-    response_body: str | None = field(default=None, repr=False)
-    request_body_truncated: bool = False
-    response_body_truncated: bool = False
 
     def to_dict(self) -> dict[str, Any]:
-        """The row-shaped view: everything except the raw bodies."""
         data = asdict(self)
-        data.pop("request_body", None)
-        data.pop("response_body", None)
         data["started_at"] = self.started_at.isoformat()
         data["finished_at"] = self.finished_at.isoformat()
         return data
-
-    @property
-    def has_bodies(self) -> bool:
-        return self.request_body is not None or self.response_body is not None
 
 
 LlmRequestSink = Callable[[LlmRequestEvent], None]
@@ -463,17 +442,6 @@ def merge_details(*parts: tuple[str, object]) -> dict[str, Any] | None:
     return sanitize_details(merged)
 
 
-def bodies_enabled() -> bool:
-    return os.getenv(CAPTURE_BODIES_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
-
-
-def body_max_bytes() -> int:
-    raw = os.getenv(BODY_MAX_BYTES_ENV, "").strip()
-    if raw.isdigit() and int(raw) > 0:
-        return int(raw)
-    return DEFAULT_BODY_MAX_BYTES
-
-
 def json_text(value: object) -> str | None:
     """``value`` as compact JSON text; None when it cannot be serialized."""
     if value is None:
@@ -488,19 +456,6 @@ def json_text(value: object) -> str | None:
         return json.dumps(value, default=str, separators=(",", ":"), ensure_ascii=False)
     except Exception:  # noqa: BLE001 - telemetry is best-effort
         return None
-
-
-def body_text(value: object) -> tuple[str | None, bool]:
-    """``(redacted body text, truncated)``, bounded at :func:`body_max_bytes`."""
-    text = json_text(value)
-    if text is None:
-        return None, False
-    limit = body_max_bytes()
-    encoded = text.encode("utf-8")
-    truncated = len(encoded) > limit
-    if truncated:
-        text = encoded[:limit].decode("utf-8", errors="ignore")
-    return redact(text), truncated
 
 
 def json_size(value: object) -> int | None:
@@ -592,7 +547,7 @@ def _litellm_finish_reason(response: object) -> str | None:
 
 
 def _litellm_request_body(kwargs: Mapping[str, Any]) -> object:
-    """The request as LiteLLM sent it.
+    """The request as LiteLLM sent it, for its size only.
 
     The provider payload LiteLLM built (``additional_args.complete_input_dict``)
     when the adapter recorded it; otherwise model, messages and the provider
@@ -610,14 +565,6 @@ def _litellm_request_body(kwargs: Mapping[str, Any]) -> object:
     if optional:
         body.update(optional)
     return body
-
-
-def _litellm_response_body(kwargs: Mapping[str, Any], response: object) -> object:
-    """The provider's own response text when LiteLLM kept it, else its normalized response."""
-    original = kwargs.get("original_response")
-    if isinstance(original, str) and original.strip():
-        return original
-    return response
 
 
 def _count(value: object) -> int | None:
@@ -745,9 +692,6 @@ def event_from_litellm(
         hidden_headers
     )
     headers = headers_from_response(response_headers) or headers_from_response(hidden_headers)
-    request_body, request_truncated = (
-        body_text(_litellm_request_body(kwargs)) if bodies_enabled() else (None, False)
-    )
 
     ttft_ms: int | None = None
     if streaming:
@@ -779,8 +723,6 @@ def event_from_litellm(
         request_bytes=json_size(_litellm_request_body(kwargs)),
         time_to_first_token_ms=ttft_ms,
         response_headers=headers,
-        request_body=request_body,
-        request_body_truncated=request_truncated,
     )
     if outcome == "success":
         return _litellm_success(base, kwargs, response, hidden, slo)
@@ -834,9 +776,6 @@ def _litellm_success(
     cost = _float_or_none(kwargs.get("response_cost"))
     if cost is None:
         cost = _float_or_none(hidden.get("response_cost"))
-    response_body, response_truncated = (
-        body_text(_litellm_response_body(kwargs, response)) if bodies_enabled() else (None, False)
-    )
     return replace(
         base,
         status_code=200,
@@ -853,8 +792,6 @@ def _litellm_success(
             ("response", _litellm_response_details(response)),
             ("litellm", _litellm_hidden_details(hidden, slo)),
         ),
-        response_body=response_body,
-        response_body_truncated=response_truncated,
     )
 
 
@@ -871,8 +808,6 @@ def _litellm_failure(
     request_id = base.provider_request_id
     headers = base.response_headers
     response_bytes: int | None = None
-    response_body: str | None = None
-    response_truncated = False
     if exc is not None:
         status_code = _int_or_none(getattr(exc, "status_code", None))
         error_type = type(exc).__name__
@@ -881,8 +816,6 @@ def _litellm_failure(
         request_id = request_id or request_id_from_headers(exc_headers)
         headers = headers or headers_from_response(exc_headers)
         response_bytes = _exception_body_size(exc)
-        if bodies_enabled():
-            response_body, response_truncated = body_text(_exception_body(exc))
     if status_code is None:
         code = error_info.get("error_code")
         status_code = _int_or_none(code)
@@ -907,8 +840,6 @@ def _litellm_failure(
             ("error", _exception_details(exc) or dict(error_info) or None),
             ("litellm", _litellm_hidden_details(hidden, slo)),
         ),
-        response_body=response_body,
-        response_body_truncated=response_truncated,
     )
 
 
@@ -1108,8 +1039,6 @@ class RequestLoggingModel(Model):
             request_bytes=request.size,
             time_to_first_token_ms=ttft_ms,
             finish_reason=finish_reason,
-            request_body=request.body,
-            request_body_truncated=request.truncated,
         )
         if exc is None:
             usage = _openai_usage(response) if response is not None else {}
@@ -1118,9 +1047,6 @@ class RequestLoggingModel(Model):
                 raw_response
                 if raw_response is not None
                 else (response.output if response is not None else None)
-            )
-            response_body, response_truncated = (
-                body_text(body_source) if bodies_enabled() else (None, False)
             )
             return replace(
                 base,
@@ -1134,13 +1060,8 @@ class RequestLoggingModel(Model):
                     ("request", request.details),
                     ("response", _openai_response_details(response, raw_response)),
                 ),
-                response_body=response_body,
-                response_body_truncated=response_truncated,
             )
         status, request_id = _openai_error_fields(exc)
-        response_body, response_truncated = (
-            body_text(_exception_body(exc)) if bodies_enabled() else (None, False)
-        )
         return replace(
             base,
             outcome="error",
@@ -1154,8 +1075,6 @@ class RequestLoggingModel(Model):
                 ("request", request.details),
                 ("error", _exception_details(exc)),
             ),
-            response_body=response_body,
-            response_body_truncated=response_truncated,
         )
 
     @staticmethod
@@ -1194,8 +1113,7 @@ class RequestLoggingModel(Model):
         details["tool_count"] = len(tools)
         details["previous_response_id"] = previous_response_id
         details["conversation_id"] = conversation_id
-        text, truncated = body_text(body) if bodies_enabled() else (None, False)
-        return _OpenAiRequest(size=json_size(body), details=details, body=text, truncated=truncated)
+        return _OpenAiRequest(size=json_size(body), details=details)
 
     async def get_response(
         self,
@@ -1353,8 +1271,6 @@ class _OpenAiRequest:
 
     size: int | None
     details: dict[str, Any]
-    body: str | None
-    truncated: bool
 
 
 def _model_settings_dict(model_settings: ModelSettings) -> dict[str, Any]:
@@ -1412,8 +1328,6 @@ __all__ = [
     "RequestLoggingModel",
     "api_host",
     "bind_call_context",
-    "bodies_enabled",
-    "body_text",
     "clean_error_message",
     "current_call_context",
     "emit",
