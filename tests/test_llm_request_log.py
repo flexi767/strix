@@ -10,10 +10,12 @@ import litellm
 import pytest
 from agents.items import ModelResponse
 from agents.models.interface import Model
+from agents.tool import FunctionTool
 from agents.usage import Usage
 from litellm.llms.anthropic.common_utils import AnthropicError
 from openai import APIStatusError, APITimeoutError, PermissionDeniedError
 from openai.types.responses import Response, ResponseCompletedEvent, ResponseCreatedEvent
+from openai.types.responses.response import IncompleteDetails
 
 from strix.llm import request_log
 
@@ -413,6 +415,166 @@ def test_log_line_sink_formats_without_content(caplog: pytest.LogCaptureFixture)
 
 
 # --------------------------------------------------------------------------- #
+# sizes, timing, finish reason, rate-limit headers                             #
+# --------------------------------------------------------------------------- #
+
+
+def test_rate_limit_headers_keep_only_rate_limit_names() -> None:
+    picked = request_log.rate_limit_from_headers(
+        {
+            "llm_provider-anthropic-ratelimit-requests-remaining": "49",
+            "Anthropic-RateLimit-Tokens-Reset": "2026-09-19T12:00:00Z",
+            "x-ratelimit-limit-requests": 5000,
+            "Retry-After": "12",
+            "authorization": "Bearer sk-ant-secret",
+            "x-api-key": "sk-ant-secret",
+            "set-cookie": "session=abc",
+            "request-id": "req_x",
+            "content-type": "application/json",
+        }
+    )
+    assert picked == {
+        "anthropic-ratelimit-requests-remaining": "49",
+        "anthropic-ratelimit-tokens-reset": "2026-09-19T12:00:00Z",
+        "x-ratelimit-limit-requests": "5000",
+        "retry-after": "12",
+    }
+    assert "secret" not in str(picked)
+    assert request_log.rate_limit_from_headers({"content-type": "json"}) is None
+    assert request_log.rate_limit_from_headers(None) is None
+
+
+def test_rate_limit_headers_are_bounded() -> None:
+    headers = {f"x-ratelimit-h{i}": "v" * 500 for i in range(100)}
+    picked = request_log.rate_limit_from_headers(headers)
+    assert picked is not None
+    assert len(picked) == request_log.RATE_LIMIT_MAX_HEADERS
+    assert all(len(v) <= 64 for v in picked.values())
+
+
+def test_json_size_counts_utf8_bytes_of_compact_json() -> None:
+    assert request_log.json_size({"a": "é"}) == len('{"a":"é"}'.encode())
+    assert request_log.json_size(None) is None
+    assert request_log.json_size(_openai_response("r")) is not None
+    assert request_log.json_size(object()) is not None  # default=str fallback
+
+
+def test_litellm_success_carries_sizes_finish_reason_and_rate_limit() -> None:
+    kwargs = _anthropic_kwargs(
+        None,
+        headers={
+            "request-id": "req_ok",
+            "anthropic-ratelimit-requests-remaining": "49",
+            "anthropic-ratelimit-tokens-remaining": "39000",
+            "x-api-key": "sk-ant-secret",
+        },
+    )
+    kwargs["optional_params"] = {"max_tokens": 4096, "temperature": 0}
+
+    class _Choice:
+        finish_reason = "tool_calls"
+
+    class _Response(_FakeResponse):
+        choices: ClassVar[list[Any]] = [_Choice()]
+
+    event = request_log.event_from_litellm(kwargs, _Response(), None, None, outcome="success")
+
+    expected_request = request_log.json_size(
+        {
+            "model": "anthropic/claude-sonnet-4-5",
+            "messages": [{"role": "user", "content": "SECRET PROMPT"}],
+            "max_tokens": 4096,
+            "temperature": 0,
+        }
+    )
+    assert event.request_bytes == expected_request
+    assert event.response_bytes is not None and event.response_bytes > 0
+    assert event.finish_reason == "tool_calls"
+    assert event.rate_limit == {
+        "anthropic-ratelimit-requests-remaining": "49",
+        "anthropic-ratelimit-tokens-remaining": "39000",
+    }
+    assert event.time_to_first_token_ms is None
+    assert "sk-ant-secret" not in str(event.to_dict())
+    assert "SECRET PROMPT" not in str(event.to_dict())
+
+
+def test_litellm_streaming_time_to_first_token_from_completion_start() -> None:
+    kwargs = _anthropic_kwargs(None, stream=True)
+    start = datetime(2026, 9, 19, 12, 0, tzinfo=UTC)
+    kwargs["completion_start_time"] = start + timedelta(milliseconds=420)
+    end = start + timedelta(seconds=3)
+
+    event = request_log.event_from_litellm(kwargs, _FakeResponse(), start, end, outcome="success")
+
+    assert event.streaming is True
+    assert event.time_to_first_token_ms == 420
+    assert event.duration_ms == 3000
+
+    no_first = request_log.event_from_litellm(
+        _anthropic_kwargs(None, stream=True), _FakeResponse(), start, end, outcome="success"
+    )
+    assert no_first.time_to_first_token_ms is None
+
+
+def test_litellm_failure_carries_status_body_size_and_rate_limit_from_exception() -> None:
+    body = '{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}'
+    exc = _anthropic_error(
+        429,
+        body,
+        {
+            "request-id": "req_429",
+            "retry-after": "7",
+            "anthropic-ratelimit-requests-remaining": "0",
+            "x-api-key": "sk-ant-secret",
+        },
+    )
+    kwargs = _anthropic_kwargs(exc)
+    kwargs["optional_params"] = {"max_tokens": 10}
+
+    event = request_log.event_from_litellm(kwargs, None, None, None, outcome="error")
+
+    assert event.status_code == 429
+    assert event.provider_request_id == "req_429"
+    assert event.request_bytes is not None and event.request_bytes > 0
+    assert event.response_bytes == len(body.encode())
+    assert event.rate_limit == {
+        "retry-after": "7",
+        "anthropic-ratelimit-requests-remaining": "0",
+    }
+    assert event.finish_reason is None
+    assert "sk-ant-secret" not in str(event.to_dict())
+
+
+def test_litellm_failure_without_headers_has_no_rate_limit() -> None:
+    exc = APITimeoutError(httpx.Request("POST", "https://api.anthropic.com/v1/messages"))
+    kwargs = _anthropic_kwargs(exc)
+    kwargs["standard_logging_object"]["error_information"]["error_code"] = ""
+    event = request_log.event_from_litellm(kwargs, None, None, None, outcome="error")
+    assert event.rate_limit is None
+    assert event.response_bytes is not None  # size of the timeout message text
+
+
+def test_to_dict_and_log_line_include_new_fields() -> None:
+    kwargs = _anthropic_kwargs(None, headers={"request-id": "req_ok"}, stream=True)
+    start = datetime(2026, 9, 19, 12, 0, tzinfo=UTC)
+    kwargs["completion_start_time"] = start + timedelta(milliseconds=100)
+    event = request_log.event_from_litellm(
+        kwargs, _FakeResponse(), start, start + timedelta(seconds=1), outcome="success"
+    )
+    data = event.to_dict()
+    for key in (
+        "request_bytes",
+        "response_bytes",
+        "time_to_first_token_ms",
+        "finish_reason",
+        "rate_limit",
+    ):
+        assert key in data
+    assert data["time_to_first_token_ms"] == 100
+
+
+# --------------------------------------------------------------------------- #
 # Native OpenAI route                                                          #
 # --------------------------------------------------------------------------- #
 
@@ -608,6 +770,133 @@ async def test_openai_route_streaming_failure_midstream(captured: list[LlmReques
     assert captured[0].outcome == "error"
     assert captured[0].status_code == 500
     assert captured[0].provider_request_id == "req_mid_stream"
+    assert captured[0].time_to_first_token_ms is not None
+    assert captured[0].response_bytes == len(b"upstream reset")
+
+
+@pytest.mark.asyncio
+async def test_openai_route_success_carries_request_and_response_sizes(
+    captured: list[LlmRequestEvent],
+) -> None:
+    tool = FunctionTool(
+        name="lookup",
+        description="Look something up",
+        params_json_schema={"type": "object", "properties": {"q": {"type": "string"}}},
+        on_invoke_tool=_noop_tool,
+    )
+    model = request_log.RequestLoggingModel(
+        _Inner(response=_openai_response("resp_sized")),
+        model_name="gpt-5",
+        provider="openai",
+        base_url=None,
+    )
+    args = list(_CALL_ARGS)
+    args[0] = "SYSTEM SECRET INSTRUCTIONS"
+    args[3] = [tool]
+    await model.get_response(*args, **_CALL_KWARGS)
+
+    event = captured[0]
+    expected = request_log.json_size(
+        {
+            "instructions": "SYSTEM SECRET INSTRUCTIONS",
+            "input": "hi",
+            "tools": [
+                {
+                    "name": "lookup",
+                    "description": "Look something up",
+                    "parameters": tool.params_json_schema,
+                }
+            ],
+        }
+    )
+    assert event.request_bytes == expected
+    assert event.response_bytes == request_log.json_size([])
+    assert event.time_to_first_token_ms is None
+    assert event.finish_reason is None
+    assert event.rate_limit is None
+    assert "SYSTEM SECRET INSTRUCTIONS" not in str(event.to_dict())
+
+
+@pytest.mark.asyncio
+async def test_openai_route_error_carries_rate_limit_headers_and_body_size(
+    captured: list[LlmRequestEvent],
+) -> None:
+    request = httpx.Request("POST", "https://api.openai.com/v1/responses")
+    body = '{"error":{"message":"Rate limit reached","type":"tokens"}}'
+    response = httpx.Response(
+        429,
+        request=request,
+        headers={
+            "x-request-id": "req_429_openai",
+            "x-ratelimit-limit-tokens": "30000",
+            "x-ratelimit-remaining-tokens": "0",
+            "x-ratelimit-reset-tokens": "6ms",
+            "retry-after": "1",
+            "openai-organization": "org-secret",
+        },
+        text=body,
+    )
+    exc = APIStatusError("rate limited", response=response, body=None)
+    model = request_log.RequestLoggingModel(
+        _Inner(exc=exc), model_name="gpt-5", provider="openai", base_url=None
+    )
+    with pytest.raises(APIStatusError):
+        await model.get_response(*_CALL_ARGS, **_CALL_KWARGS)
+
+    event = captured[0]
+    assert event.status_code == 429
+    assert event.provider_request_id == "req_429_openai"
+    assert event.rate_limit == {
+        "x-ratelimit-limit-tokens": "30000",
+        "x-ratelimit-remaining-tokens": "0",
+        "x-ratelimit-reset-tokens": "6ms",
+        "retry-after": "1",
+    }
+    assert event.response_bytes is not None and event.response_bytes > 0
+    assert "org-secret" not in str(event.to_dict())
+
+
+@pytest.mark.asyncio
+async def test_openai_route_streaming_ttft_and_finish_reason(
+    captured: list[LlmRequestEvent],
+) -> None:
+    created = ResponseCreatedEvent(
+        response=_completed_event("resp_fin").response,
+        sequence_number=0,
+        type="response.created",
+    )
+    completed = _completed_event("resp_fin")
+    completed.response.status = "incomplete"
+    completed.response.incomplete_details = IncompleteDetails(reason="max_output_tokens")
+    model = request_log.RequestLoggingModel(
+        _Inner(stream_events=[created, completed]),
+        model_name="gpt-5",
+        provider="openai",
+        base_url=None,
+    )
+    async for _ in model.stream_response(*_CALL_ARGS, **_CALL_KWARGS):
+        pass
+
+    event = captured[0]
+    assert event.streaming is True
+    assert event.time_to_first_token_ms is not None
+    assert event.time_to_first_token_ms <= event.duration_ms
+    assert event.finish_reason == "incomplete:max_output_tokens"
+
+    captured.clear()
+    plain = request_log.RequestLoggingModel(
+        _Inner(stream_events=[created, _completed_event("resp_done")]),
+        model_name="gpt-5",
+        provider="openai",
+        base_url=None,
+    )
+    async for _ in plain.stream_response(*_CALL_ARGS, **_CALL_KWARGS):
+        pass
+    assert captured[0].finish_reason is None or captured[0].finish_reason == "completed"
+
+
+async def _noop_tool(_ctx: Any, _args: str) -> str:
+    return ""
 
 
 @pytest.mark.asyncio
