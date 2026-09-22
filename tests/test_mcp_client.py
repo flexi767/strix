@@ -44,6 +44,7 @@ from strix.tools.mcp import (
     search_mcp_tools,
 )
 from strix.tools.mcp import client as mcp_client
+from strix.tools.mcp import registry as mcp_registry_mod
 from strix.tools.mcp import session as mcp_session_mod
 
 
@@ -575,6 +576,36 @@ async def test_registered_entry_connects_and_lists_once_for_concurrent_catalog_r
     assert second is first
     assert calls == {"build": 1, "list": 1}
     assert registry.statuses()[0].state == "catalog_ready"
+    await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_registered_entry_replaces_a_terminally_dead_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config("docs", ["fetch_page"])
+    original = SupervisedMcpSession.adopt(
+        FakeMCPServer("docs", [_mcp_tool("fetch_page")]),
+        name="docs",
+        config=config,
+    )
+    replacement_server = FakeMCPServer("docs", [_mcp_tool("fetch_page")])
+    monkeypatch.setattr(
+        mcp_client,
+        "_build_server",
+        lambda _config: _built_server(replacement_server),
+    )
+    monkeypatch.setattr(mcp_registry_mod, "_RETRY_DELAY_SECONDS", 0)
+    registry = McpRegistry()
+    entry = registry.add(name="docs", session=original, config=config)
+
+    original._mark_dead()
+
+    assert entry.session is None
+    replacement = await entry.ensure_connected()
+    assert replacement is not original
+    assert replacement.server is replacement_server
+    assert entry.state == "connected"
     await registry.close()
 
 

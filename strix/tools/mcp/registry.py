@@ -143,8 +143,10 @@ class McpConnectionEntry:
             self._status_sink()
 
     def _on_dead(self) -> None:
+        self.session = None
         self._catalog = None
         self._catalog_task = None
+        self._retry_after = time.monotonic() + _RETRY_DELAY_SECONDS
         self._set_state("unavailable")
 
     async def ensure_connected(self) -> SupervisedMcpSession:
