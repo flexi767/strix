@@ -19,12 +19,15 @@ export default function VulnReportDeleteRenderer({ args, result, status }: ToolR
   const title = typeof res?.title === "string" ? res.title : "";
   const severity = typeof res?.severity === "string" ? res.severity.toLowerCase() : "";
   const failed = res != null ? !ok : status === "failed" || status === "error";
+  const pending = res == null && !failed;
+  const label = pending ? "withdrawing report\u2026" : failed ? "report not withdrawn" : "report withdrawn";
+  const labelColor = pending ? "text-[#888]" : failed ? "text-red-400/80" : "text-yellow-400/80";
 
   return (
     <div className="space-y-2">
       <div className="flex items-center gap-2 flex-wrap">
-        <span className={`font-semibold text-sm ${failed ? "text-red-400/80" : "text-yellow-400/80"}`}>
-          {failed ? "report not withdrawn" : "report withdrawn"}
+        <span className={`font-semibold text-sm ${labelColor}`} aria-live="polite">
+          {label}
         </span>
         {reportId && <span className="text-[#555] font-mono text-[13px]">{reportId}</span>}
         {severity && (

@@ -13,7 +13,8 @@ from strix.report.dedupe import (
     _prepare_report_for_comparison,
     check_duplicate,
 )
-from strix.report.state import ReportOwnershipError, ReportState, set_global_report_state
+from strix.report.state import ReportRollbackError, ReportState, set_global_report_state
+from strix.report.writer import write_run_record
 from strix.tools.finish.tool import finish_scan
 from strix.tools.reporting import tool as reporting_tool
 from strix.tools.reporting.tool import (
@@ -2061,61 +2062,28 @@ def _assert_report_still_filed(
     assert report_state._next_report_id() == "vuln-0010"
 
 
-@pytest.mark.parametrize(
-    ("agent_id", "agent_name"),
-    [("834f79fb", "Validation Agent"), (None, None)],
-    ids=["another agent", "no caller identity"],
-)
-def test_delete_refuses_a_report_the_caller_did_not_file(
-    report_state: ReportState, agent_id: str | None, agent_name: str | None
-) -> None:
-    """Report ids are sequential and listed to every agent; knowing one is not owning it."""
+def test_any_agent_in_the_run_may_delete_a_report(report_state: ReportState) -> None:
+    """Agents in a run share one trust boundary: a report another agent filed can be
+    withdrawn once disproved, and the history keeps both identities apart."""
     run_dir = _seed_saved_report(report_state)
-    original = dict(report_state.vulnerability_reports[0])
     calls: list[dict[str, Any]] = []
     report_state.vulnerability_deleted_callback = calls.append
 
     result = _do_delete(
         report_id="vuln-0009",
         delete_reason="Disproved.",
-        agent_id=agent_id,
-        agent_name=agent_name,
+        agent_id="834f79fb",
+        agent_name="Validation Agent",
     )
 
-    assert result["success"] is False
-    assert "filed by agent aaaa1111" in result["error"]
-    assert "send that agent your counterevidence" in result["error"]
-    assert calls == [], "a refused deletion never reaches persistence"
-    _assert_report_still_filed(report_state, run_dir, original)
-
-
-def test_delete_refuses_a_foreign_report_at_the_state_layer(report_state: ReportState) -> None:
-    _seed_saved_report(report_state)
-
-    with pytest.raises(ReportOwnershipError) as excinfo:
-        report_state.delete_vulnerability_report(
-            "vuln-0009", delete_reason="Disproved.", deleted_by_agent_id="834f79fb"
-        )
-
-    assert excinfo.value.filed_by == "aaaa1111"
-    assert excinfo.value.caller == "834f79fb"
-    assert len(report_state.vulnerability_reports) == 1
-
-
-def test_delete_allows_a_report_filed_without_an_agent(report_state: ReportState) -> None:
-    """A report with no filer on record (host-side or legacy) has no owner to check."""
-    _seed_saved_report(report_state)
-    del report_state.vulnerability_reports[0]["agent_id"]
-
-    deleted = report_state.delete_vulnerability_report(
-        "vuln-0009", delete_reason="Disproved.", deleted_by_agent_id="834f79fb"
-    )
-
-    assert deleted is not None
+    assert result["success"] is True
     assert report_state.vulnerability_reports == []
-    history = report_state.run_record["deleted_vulnerability_reports"]
-    assert history[0]["agent_id"] == "834f79fb"
-    assert "filed_by_agent_id" not in history[0]
+    assert [c["id"] for c in calls] == ["vuln-0009"]
+    assert not (run_dir / "vulnerabilities" / "vuln-0009.md").exists()
+    (deletion,) = report_state.run_record["deleted_vulnerability_reports"]
+    assert deletion["filed_by_agent_id"] == "aaaa1111"
+    assert deletion["agent_id"] == "834f79fb"
+    assert deletion["agent_name"] == "Validation Agent"
 
 
 def test_delete_reports_persistence_failure_and_keeps_the_report(
@@ -2166,6 +2134,45 @@ def test_delete_reports_an_artifact_write_failure_and_keeps_the_report(
     assert "still on file" in result["error"]
     assert calls == []
     assert attempts == 2, "the run record is written back after the failed rewrite"
+    _assert_report_still_filed(report_state, run_dir, original)
+
+
+def test_delete_reports_when_the_rollback_itself_cannot_be_written(
+    report_state: ReportState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A disk that stays full: memory is restored, the caller is told the indexes
+    may be stale, and the next save rewrites them."""
+    run_dir = _seed_saved_report(report_state)
+    original = dict(report_state.vulnerability_reports[0])
+    calls: list[dict[str, Any]] = []
+    report_state.vulnerability_deleted_callback = calls.append
+    disk_full = True
+
+    def write_run_record_while_disk_full(run_dir_: Path, record: dict[str, Any]) -> None:
+        if disk_full:
+            raise OSError(28, "No space left on device")
+        write_run_record(run_dir_, record)
+
+    monkeypatch.setattr("strix.report.state.write_run_record", write_run_record_while_disk_full)
+
+    with pytest.raises(ReportRollbackError) as excinfo:
+        report_state.delete_vulnerability_report(
+            "vuln-0009", delete_reason="Disproved.", deleted_by_agent_id="aaaa1111"
+        )
+
+    assert isinstance(excinfo.value.cause, OSError)
+    assert calls == []
+    assert report_state.vulnerability_reports == [original]
+    assert "vuln-0009" in report_state._saved_vuln_ids
+    assert "deleted_vulnerability_reports" not in report_state.run_record
+
+    result = _do_delete(report_id="vuln-0009", delete_reason="Disproved.", agent_id="aaaa1111")
+    assert result["success"] is False
+    assert "No space left on device" in result["error"]
+    assert "may be stale" in result["error"]
+
+    disk_full = False
+    report_state.save_run_data()
     _assert_report_still_filed(report_state, run_dir, original)
 
 

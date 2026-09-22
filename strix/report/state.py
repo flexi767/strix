@@ -36,16 +36,20 @@ _global_report_state: Optional["ReportState"] = None
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]+")
 
 
-class ReportOwnershipError(PermissionError):
-    """Raised when an agent tries to withdraw a report another agent filed."""
+class ReportRollbackError(RuntimeError):
+    """Raised when a failed deletion could not rewrite the on-disk indexes.
 
-    def __init__(self, report_id: str, *, filed_by: str, caller: str | None) -> None:
+    The report is still on file in memory; the indexes are rewritten from
+    memory on the next save.
+    """
+
+    def __init__(self, report_id: str, *, cause: BaseException) -> None:
         self.report_id = report_id
-        self.filed_by = filed_by
-        self.caller = caller
+        self.cause = cause
         super().__init__(
-            f"Report '{report_id}' was filed by agent {filed_by}, not by "
-            f"{caller or 'the caller'}; only the agent that filed a report can withdraw it"
+            f"Deletion of report '{report_id}' failed ({cause}) and the on-disk indexes "
+            "could not be restored; the report is still on file and the indexes are "
+            "rewritten on the next save"
         )
 
 
@@ -558,26 +562,22 @@ class ReportState:
     ) -> dict[str, Any] | None:
         """Withdraw a report from the run, keeping a record of the withdrawal.
 
-        Returns the removed report, or ``None`` when the id is unknown. Only the
-        agent that filed a report may withdraw it (:class:`ReportOwnershipError`
-        otherwise). The report leaves ``vulnerability_reports`` and its rendered
-        artifacts; the run record keeps who withdrew it and why, so the id is
+        Returns the removed report, or ``None`` when the id is unknown. Every
+        agent in a run shares one trust boundary, so any of them may withdraw
+        any report (just as any of them may revise one); the run record keeps
+        who filed it, who withdrew it and why. The report leaves
+        ``vulnerability_reports`` and its rendered artifacts, and its id is
         never reissued.
 
         The rewritten artifacts and the ``vulnerability_deleted_callback`` must
         both accept the deletion first: if either fails the report is put back
-        and the error propagates, so the deletion can be retried.
+        and the error propagates, so the deletion can be retried
+        (:class:`ReportRollbackError` when the indexes could not be put back).
         """
         report = next((r for r in self.vulnerability_reports if r.get("id") == report_id), None)
         if report is None:
             logger.warning("cannot delete unknown vulnerability report %s", report_id)
             return None
-
-        filed_by = report.get("agent_id")
-        if filed_by and deleted_by_agent_id != filed_by:
-            raise ReportOwnershipError(
-                report_id, filed_by=str(filed_by), caller=deleted_by_agent_id
-            )
 
         entry: dict[str, Any] = {
             "id": report_id,
@@ -608,7 +608,7 @@ class ReportState:
             self._write_artifacts()
             if self.vulnerability_deleted_callback:
                 self.vulnerability_deleted_callback({**report, "deletion": entry})
-        except Exception:
+        except Exception as exc:
             self.vulnerability_reports.insert(position, report)
             if was_saved:
                 self._saved_vuln_ids.add(report_id)
@@ -616,7 +616,13 @@ class ReportState:
                 self.run_record["deleted_vulnerability_reports"] = history
             else:
                 self.run_record.pop("deleted_vulnerability_reports", None)
-            self._save_artifacts()
+            try:
+                self._write_artifacts()
+            except Exception as rollback_exc:
+                logger.exception(
+                    "could not restore artifacts after failed deletion of %s", report_id
+                )
+                raise ReportRollbackError(report_id, cause=exc) from rollback_exc
             raise
 
         md_path = self.get_run_dir() / "vulnerabilities" / f"{report_id}.md"
