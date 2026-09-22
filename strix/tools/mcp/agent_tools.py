@@ -138,7 +138,7 @@ def _search_score(tool: MCPTool, query_terms: list[str], active: bool) -> tuple[
         elif term in description:
             score += 10
             matched_terms += 1
-    if matched_terms == 0 and not active:
+    if matched_terms == 0:
         return (-1, name)
     return (score + (matched_terms * 5), name)
 
@@ -178,6 +178,10 @@ async def search_mcp_tools(
         for tool in tools
         if (score := _search_score(tool, terms, tool.name in entry.active_tools))[0] >= 0
     ]
+    if not ranked:
+        ranked = [
+            ((100, tool.name.lower()), tool) for tool in tools if tool.name in entry.active_tools
+        ]
     ranked.sort(key=lambda item: (-item[0][0], item[0][1]))
     return {
         "connection": connection,

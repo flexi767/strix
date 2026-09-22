@@ -549,7 +549,7 @@ async def test_search_matches_any_query_term_and_prioritizes_active_tools() -> N
             [
                 MCPTool(
                     name="fetch_page",
-                    description="Fetch page content",
+                    description="Read page content",
                     inputSchema={"type": "object"},
                 ),
                 MCPTool(
