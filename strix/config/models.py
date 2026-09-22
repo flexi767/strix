@@ -40,6 +40,7 @@ from strix.config import codex
 from strix.config.loader import load_settings
 from strix.config.tool_call_ids import TurnCallIdRewriter, dedupe_input
 from strix.config.tool_call_limits import TurnToolCallLimiter
+from strix.llm import request_log
 
 
 if TYPE_CHECKING:
@@ -525,13 +526,25 @@ class StrixProvider(MultiProvider):
             # The ChatGPT subscription backend is always streamed; it has no
             # non-streaming mode to fall back to, so LLM_DISABLE_STREAMING
             # does not apply here.
-            model: Model = _CodexResponsesModel(
-                slug,
-                codex.get_subscription_client(),
-                reasoning_effort=llm.reasoning_effort,
+            model: Model = request_log.RequestLoggingModel(
+                _CodexResponsesModel(
+                    slug,
+                    codex.get_subscription_client(),
+                    reasoning_effort=llm.reasoning_effort,
+                ),
+                model_name=slug,
+                provider="openai-codex",
+                base_url=None,
             )
         else:
             model = super().get_model(model_name)
+            if not _routes_via_litellm(model):
+                model = request_log.RequestLoggingModel(
+                    model,
+                    model_name=model_name or llm.model or "unknown",
+                    provider="openai",
+                    base_url=self._override_base_url or llm.api_base,
+                )
             if llm.disable_streaming:
                 model = _NonStreamingModel(model)
                 # The wrapper emits its single event only once the whole request
@@ -543,6 +556,13 @@ class StrixProvider(MultiProvider):
             max_tool_calls_per_turn=llm.max_tool_calls_per_turn,
             stream_idle_timeout=idle_timeout,
         )
+
+
+def _routes_via_litellm(model: Model) -> bool:
+    """LiteLLM-backed models are captured by the LiteLLM callback, not the wrapper."""
+    from agents.extensions.models.litellm_model import LitellmModel
+
+    return isinstance(model, LitellmModel)
 
 
 DEFAULT_MODEL_RETRY = ModelRetrySettings(
@@ -621,6 +641,7 @@ def configure_sdk_model_defaults(settings: Settings) -> None:
     """Apply Strix config to SDK-native defaults."""
     llm = settings.llm
     set_tracing_disabled(True)
+    request_log.install()
     if codex.subscription_model(llm.model):
         return
     _configure_litellm_compatibility()

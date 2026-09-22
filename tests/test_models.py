@@ -23,6 +23,7 @@ from strix.config.models import (
     uses_chat_completions_tool_schema,
 )
 from strix.config.settings import Settings
+from strix.llm.request_log import RequestLoggingModel
 
 
 @pytest.mark.parametrize("model_name", RECOMMENDED_MODEL_NAMES)
@@ -172,7 +173,7 @@ def test_routes_through_litellm_matches_the_provider(
         # proves the route is not LiteLLM's.
         assert not litellm
         return
-    while isinstance(model, _NonStreamingModel | _TurnGuardModel):
+    while isinstance(model, _NonStreamingModel | _TurnGuardModel | RequestLoggingModel):
         model = model._inner
     assert isinstance(model, LitellmModel) is litellm
 
@@ -215,6 +216,6 @@ def test_api_type_overrides_the_api_base_route(
         monkeypatch.setenv("STRIX_API_TYPE", api_type)
     configure_sdk_model_defaults(Settings())
     model = StrixProvider().get_model("gpt-5")
-    while isinstance(model, _NonStreamingModel | _TurnGuardModel):
+    while isinstance(model, _NonStreamingModel | _TurnGuardModel | RequestLoggingModel):
         model = model._inner
     assert isinstance(model, expected)

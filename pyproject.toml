@@ -308,6 +308,9 @@ ignore = [
 "strix/report/dedupe.py" = ["PLC0415"]
 "strix/telemetry/logging.py" = ["PLC0415"]
 "strix/config/models.py" = ["PLC0415"]
+# LiteLLM is imported lazily: the request log is wired at startup on every
+# route, including the native OpenAI ones that never load LiteLLM.
+"strix/llm/request_log.py" = ["PLC0415"]
 # Heavy inference deps (httpx, openai) imported lazily so auth-status checks
 # don't pull them in.
 "strix/config/codex.py" = ["PLC0415"]
