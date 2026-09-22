@@ -221,6 +221,7 @@ class ReportState:
         self.caido_url: str | None = None
         self.vulnerability_found_callback: Callable[[dict[str, Any]], None] | None = None
         self.vulnerability_updated_callback: Callable[[dict[str, Any]], None] | None = None
+        self.vulnerability_deleted_callback: Callable[[dict[str, Any]], None] | None = None
 
         self._sarif_repo_ctx: dict[str, Any] | None = None
         self._sarif_repo_ctx_ready: bool = False
@@ -342,7 +343,7 @@ class ReportState:
         agent_id: str | None = None,
         agent_name: str | None = None,
     ) -> str:
-        report_id = f"vuln-{len(self.vulnerability_reports) + 1:04d}"
+        report_id = self._next_report_id()
 
         report: dict[str, Any] = {
             "id": report_id,
@@ -417,6 +418,24 @@ class ReportState:
 
         self.save_run_data()
         return report_id
+
+    def _deleted_vulnerability_reports(self) -> list[dict[str, Any]]:
+        raw = self.run_record.get("deleted_vulnerability_reports")
+        return [e for e in raw if isinstance(e, dict)] if isinstance(raw, list) else []
+
+    def _next_report_id(self) -> str:
+        """Allocate the id after every id this run has ever handed out.
+
+        A deleted report leaves the list, so counting entries would hand its id
+        to the next finding and let that finding overwrite the deleted MD on disk
+        and inherit its history in every consumer that keys on the id.
+        """
+        used = 0
+        for entry in [*self.vulnerability_reports, *self._deleted_vulnerability_reports()]:
+            match = re.fullmatch(r"vuln-(\d+)", str(entry.get("id", "")))
+            if match:
+                used = max(used, int(match.group(1)))
+        return f"vuln-{used + 1:04d}"
 
     def update_vulnerability_report(
         self,
@@ -512,6 +531,63 @@ class ReportState:
             report_id,
             ", ".join(entry["fields"]) or "no field replaced",
         )
+
+        self.save_run_data()
+        return report
+
+    def delete_vulnerability_report(
+        self,
+        report_id: str,
+        *,
+        delete_reason: str,
+        deleted_by_agent_id: str | None = None,
+        deleted_by_agent_name: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Withdraw a report from the run, keeping a record of the withdrawal.
+
+        Returns the removed report, or ``None`` when the id is unknown. The
+        report leaves ``vulnerability_reports`` and its rendered artifacts; the
+        run record keeps who withdrew it and why, so the id is never reissued.
+        """
+        report = next((r for r in self.vulnerability_reports if r.get("id") == report_id), None)
+        if report is None:
+            logger.warning("cannot delete unknown vulnerability report %s", report_id)
+            return None
+
+        entry: dict[str, Any] = {
+            "id": report_id,
+            "title": report.get("title"),
+            "severity": report.get("severity"),
+            "filed_at": report.get("timestamp"),
+            "deleted_at": datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "reason": delete_reason.strip()[:500],
+        }
+        if report.get("agent_id"):
+            entry["filed_by_agent_id"] = report["agent_id"]
+        if deleted_by_agent_id:
+            entry["agent_id"] = deleted_by_agent_id
+        if deleted_by_agent_name:
+            entry["agent_name"] = deleted_by_agent_name
+
+        # Persistence must accept the deletion before local state changes. A
+        # failed callback leaves the report on file and the deletion retryable.
+        if self.vulnerability_deleted_callback:
+            self.vulnerability_deleted_callback({**report, "deletion": entry})
+
+        self.vulnerability_reports.remove(report)
+        self._saved_vuln_ids.discard(report_id)
+        self.run_record["deleted_vulnerability_reports"] = [
+            *self._deleted_vulnerability_reports(),
+            entry,
+        ]
+
+        md_path = self.get_run_dir() / "vulnerabilities" / f"{report_id}.md"
+        try:
+            md_path.unlink(missing_ok=True)
+        except OSError:
+            logger.exception("could not remove %s", md_path)
+
+        logger.info("Deleted vulnerability report %s - %s", report_id, report.get("title"))
 
         self.save_run_data()
         return report
@@ -714,7 +790,9 @@ class ReportState:
             if self.final_scan_result:
                 write_executive_report(run_dir, self.final_scan_result)
 
-            if self.vulnerability_reports:
+            # An index is written for an empty list too once a report was
+            # deleted, or the CSV/JSON on disk would still list it.
+            if self.vulnerability_reports or self._deleted_vulnerability_reports():
                 write_vulnerabilities(run_dir, self.vulnerability_reports, self._saved_vuln_ids)
 
             # SARIF 2.1.0 emitter for CI / ASPM integration. Always emit (even

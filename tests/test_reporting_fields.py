@@ -19,11 +19,13 @@ from strix.tools.reporting import tool as reporting_tool
 from strix.tools.reporting.tool import (
     _do_create,
     _do_create_dependency,
+    _do_delete,
     _do_update,
     _normalize_http_exchange_ids,
     _verify_http_exchange_ids,
     create_dependency_report,
     create_vulnerability_report,
+    delete_vulnerability_report,
     update_vulnerability_report,
 )
 
@@ -1976,3 +1978,137 @@ def test_update_refuses_code_locations_it_cannot_use(report_state: ReportState) 
 
     assert result["success"] is False
     assert any("start_line" in error for error in result["errors"])
+
+
+def _seed_saved_report(report_state: ReportState) -> Path:
+    """The weak report, written to disk the way a filed finding is."""
+    _seed_weak_report(report_state)
+    report_state._saved_vuln_ids.clear()
+    report_state.save_run_data()
+    run_dir = report_state._run_dir
+    assert run_dir is not None
+    md_path = run_dir / "vulnerabilities" / "vuln-0009.md"
+    assert md_path.exists()
+    return run_dir
+
+
+def test_delete_withdraws_a_disproved_report_and_its_artifacts(
+    report_state: ReportState,
+) -> None:
+    """A deleted finding leaves the run's state and every rendered artifact."""
+    run_dir = _seed_saved_report(report_state)
+    persisted: list[dict[str, Any]] = []
+    report_state.vulnerability_deleted_callback = persisted.append
+
+    result = _do_delete(
+        report_id="vuln-0009",
+        delete_reason="The cross-tenant read came from the harness reusing the victim's session.",
+        agent_id="834f79fb",
+        agent_name="Validation Agent",
+    )
+
+    assert result["success"] is True
+    assert result["action"] == "deleted"
+    assert result["report_id"] == "vuln-0009"
+    assert result["title"].startswith("Directus 11.5.1")
+    assert report_state.vulnerability_reports == []
+    assert not (run_dir / "vulnerabilities" / "vuln-0009.md").exists()
+    assert json.loads((run_dir / "vulnerabilities.json").read_text(encoding="utf-8")) == []
+    assert "vuln-0009" not in (run_dir / "vulnerabilities.csv").read_text(encoding="utf-8")
+
+    assert len(persisted) == 1
+    assert persisted[0]["id"] == "vuln-0009"
+    assert persisted[0]["agent_id"] == "aaaa1111", "the callback sees the finding as filed"
+    deletion = persisted[0]["deletion"]
+    assert deletion["agent_id"] == "834f79fb"
+    assert deletion["agent_name"] == "Validation Agent"
+    assert deletion["filed_by_agent_id"] == "aaaa1111"
+    assert deletion["reason"].startswith("The cross-tenant read")
+
+    run = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+    history = run["deleted_vulnerability_reports"]
+    assert [entry["id"] for entry in history] == ["vuln-0009"]
+    assert history[0]["severity"] == "medium"
+    assert history[0]["deleted_at"]
+
+
+def test_delete_never_reissues_the_withdrawn_id(report_state: ReportState) -> None:
+    """The next finding must not inherit a deleted report's id, file or history."""
+    _seed_saved_report(report_state)
+    assert report_state.delete_vulnerability_report("vuln-0009", delete_reason="Disproved.")
+
+    new_id = report_state.add_vulnerability_report(title="A real finding", severity="high")
+
+    assert new_id == "vuln-0010"
+    assert [r["id"] for r in report_state.vulnerability_reports] == ["vuln-0010"]
+
+
+def test_delete_reports_persistence_failure_and_keeps_the_report(
+    report_state: ReportState,
+) -> None:
+    run_dir = _seed_saved_report(report_state)
+    original = dict(report_state.vulnerability_reports[0])
+
+    def fail_persistence(_report: dict[str, Any]) -> None:
+        raise RuntimeError("persistence failed")
+
+    report_state.vulnerability_deleted_callback = fail_persistence
+
+    result = _do_delete(report_id="vuln-0009", delete_reason="Disproved.")
+
+    assert result["success"] is False
+    assert "persistence failed" in result["error"]
+    assert "still on file" in result["error"]
+    assert report_state.vulnerability_reports == [original]
+    assert (run_dir / "vulnerabilities" / "vuln-0009.md").exists()
+    assert "deleted_vulnerability_reports" not in report_state.run_record
+    assert report_state._next_report_id() == "vuln-0010"
+
+
+@pytest.mark.parametrize(
+    ("report_id", "delete_reason", "expected"),
+    [
+        ("  ", "reason", "report_id cannot be empty"),
+        ("vuln-0009", "   ", "delete_reason cannot be empty"),
+        ("vuln-0404", "reason", "not found"),
+    ],
+)
+def test_delete_rejects_a_call_it_cannot_act_on(
+    report_state: ReportState,
+    report_id: str,
+    delete_reason: str,
+    expected: str,
+) -> None:
+    _seed_weak_report(report_state)
+    calls: list[dict[str, Any]] = []
+    report_state.vulnerability_deleted_callback = calls.append
+
+    result = _do_delete(report_id=report_id, delete_reason=delete_reason)
+
+    assert result["success"] is False
+    assert expected in result["error"]
+    assert len(report_state.vulnerability_reports) == 1
+    assert calls == [], "nothing reaches persistence for a call that is refused"
+
+
+async def test_delete_tool_carries_the_caller_identity(report_state: ReportState) -> None:
+    _seed_saved_report(report_state)
+    coordinator = type("Coordinator", (), {"names": {"834f79fb": "Validation Agent"}})()
+    ctx = ToolContext(
+        context={"agent_id": "834f79fb", "coordinator": coordinator},
+        tool_name="delete_vulnerability_report",
+        tool_call_id="call-1",
+        tool_arguments="{}",
+    )
+
+    raw = await delete_vulnerability_report.on_invoke_tool(
+        ctx,
+        json.dumps({"report_id": "vuln-0009", "delete_reason": "Disproved on re-test."}),
+    )
+    result = json.loads(raw)
+
+    assert result["success"] is True
+    history = report_state.run_record["deleted_vulnerability_reports"]
+    assert history[0]["agent_id"] == "834f79fb"
+    assert history[0]["agent_name"] == "Validation Agent"
+    assert "update_vulnerability_report" in delete_vulnerability_report.description
