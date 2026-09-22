@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
@@ -90,12 +91,13 @@ def _anthropic_kwargs(
     return kwargs
 
 
+@dataclass
 class _FakeUsage:
-    prompt_tokens = 120
-    completion_tokens = 30
-    total_tokens = 150
-    prompt_tokens_details = None
-    cache_read_input_tokens = 100
+    prompt_tokens: int = 120
+    completion_tokens: int = 30
+    total_tokens: int = 150
+    prompt_tokens_details: None = None
+    cache_read_input_tokens: int = 100
 
 
 class _FakeResponse:
@@ -415,22 +417,35 @@ def test_log_line_sink_formats_without_content(caplog: pytest.LogCaptureFixture)
 
 
 # --------------------------------------------------------------------------- #
-# sizes, timing, finish reason, rate-limit headers                             #
+# sizes, timing, finish reason, free-form headers and details                  #
 # --------------------------------------------------------------------------- #
 
 
-def test_rate_limit_headers_keep_only_rate_limit_names() -> None:
-    picked = request_log.rate_limit_from_headers(
+def test_response_headers_keep_everything_but_credentials() -> None:
+    picked = request_log.headers_from_response(
         {
             "llm_provider-anthropic-ratelimit-requests-remaining": "49",
             "Anthropic-RateLimit-Tokens-Reset": "2026-09-19T12:00:00Z",
             "x-ratelimit-limit-requests": 5000,
             "Retry-After": "12",
-            "authorization": "Bearer sk-ant-secret",
-            "x-api-key": "sk-ant-secret",
-            "set-cookie": "session=abc",
             "request-id": "req_x",
             "content-type": "application/json",
+            "cf-ray": "8f0-FRA",
+            "x-should-retry": "false",
+            "openai-processing-ms": "812",
+            "x-vendor-new-header": "kept without a code change",
+            "authorization": "Bearer sk-ant-secret",
+            "Proxy-Authorization": "Basic abc",
+            "WWW-Authenticate": "Bearer realm=x",
+            "x-api-key": "sk-ant-secret",
+            "api-key": "azure-secret",
+            "set-cookie": "session=abc",
+            "x-session-token": "abc",
+            "x-amz-signature": "sig",
+            "x-goog-api-key": "AIzaSyA-secret-key-value-1234567890",
+            "x-leaky": "token sk-ant-api03-abcdefghijklmnopqrstu inside",
+            "x-empty": "   ",
+            "x-object": {"not": "a string"},
         }
     )
     assert picked == {
@@ -438,18 +453,91 @@ def test_rate_limit_headers_keep_only_rate_limit_names() -> None:
         "anthropic-ratelimit-tokens-reset": "2026-09-19T12:00:00Z",
         "x-ratelimit-limit-requests": "5000",
         "retry-after": "12",
+        "request-id": "req_x",
+        "content-type": "application/json",
+        "cf-ray": "8f0-FRA",
+        "x-should-retry": "false",
+        "openai-processing-ms": "812",
+        "x-vendor-new-header": "kept without a code change",
+        "x-leaky": "token [REDACTED] inside",
     }
     assert "secret" not in str(picked)
-    assert request_log.rate_limit_from_headers({"content-type": "json"}) is None
-    assert request_log.rate_limit_from_headers(None) is None
+    assert request_log.headers_from_response({}) is None
+    assert request_log.headers_from_response(None) is None
 
 
-def test_rate_limit_headers_are_bounded() -> None:
-    headers = {f"x-ratelimit-h{i}": "v" * 500 for i in range(100)}
-    picked = request_log.rate_limit_from_headers(headers)
+def test_response_headers_are_bounded() -> None:
+    headers = {f"x-h{i}": "v" * 5000 for i in range(200)}
+    picked = request_log.headers_from_response(headers)
     assert picked is not None
-    assert len(picked) == request_log.RATE_LIMIT_MAX_HEADERS
-    assert all(len(v) <= 64 for v in picked.values())
+    assert len(picked) == request_log.HEADERS_MAX_COUNT
+    assert all(len(v) <= request_log.HEADER_VALUE_MAX_CHARS for v in picked.values())
+
+
+def test_details_drop_content_and_credentials_keep_metadata() -> None:
+    details = request_log.sanitize_details(
+        {
+            "max_tokens": 4096,
+            "temperature": 0,
+            "thinking": {"type": "enabled", "budget_tokens": 1024},
+            "messages": [{"role": "user", "content": "SECRET PROMPT"}],
+            "tools": [{"name": "t", "input_schema": {}}],
+            "api_key": "sk-ant-secret",
+            "extra_headers": {"authorization": "Bearer x"},
+            "api_base": "https://gw.example/v1?token=abc#frag",
+            "usage": {
+                "input_tokens": 10,
+                "cache_creation_input_tokens": 3,
+                "server_tool_use": {"web_search_requests": 1},
+            },
+            "note": "leaked sk-ant-api03-abcdefghijklmnopqrstu here",
+            "when": datetime(2026, 9, 19, tzinfo=UTC),
+            "nested": {"a": {"b": {"c": {"d": {"e": {"f": {"g": 1}}}}}}},
+            "empty": {},
+            "none": None,
+        }
+    )
+    assert details == {
+        "max_tokens": 4096,
+        "temperature": 0,
+        "thinking": {"type": "enabled", "budget_tokens": 1024},
+        "api_base": "https://gw.example/v1",
+        "usage": {
+            "input_tokens": 10,
+            "cache_creation_input_tokens": 3,
+            "server_tool_use": {"web_search_requests": 1},
+        },
+        "note": "leaked [REDACTED] here",
+        "when": "2026-09-19T00:00:00+00:00",
+        "nested": {"a": {"b": {"c": {"d": {"e": "…"}}}}},
+    }
+    assert request_log.sanitize_details({}) is None
+    assert request_log.sanitize_details("not a mapping") is None
+    assert request_log.sanitize_details({"messages": []}) is None
+
+
+def test_details_are_bounded_by_size_and_name_the_dropped_keys() -> None:
+    big = {"small": 1, "huge": ["x" * 200] * 32, "medium": {"k": "y" * 200}}
+    request_log.DETAILS_MAX_BYTES, saved = 1024, request_log.DETAILS_MAX_BYTES
+    try:
+        details = request_log.sanitize_details(big)
+    finally:
+        request_log.DETAILS_MAX_BYTES = saved
+    assert details is not None
+    assert details["small"] == 1
+    assert details["_dropped"] == ["huge"]
+    assert "huge" not in details
+    assert (request_log.json_size(details) or 0) <= 1024
+
+
+def test_details_list_and_string_bounds() -> None:
+    details = request_log.sanitize_details(
+        {"items": list(range(100)), "long": "z" * 1000, "keys": {str(i): i for i in range(100)}}
+    )
+    assert details is not None
+    assert len(details["items"]) == request_log.DETAILS_MAX_ITEMS
+    assert len(details["long"]) == request_log.DETAILS_MAX_STRING
+    assert len(details["keys"]) == request_log.DETAILS_MAX_ITEMS
 
 
 def test_json_size_counts_utf8_bytes_of_compact_json() -> None:
@@ -459,23 +547,33 @@ def test_json_size_counts_utf8_bytes_of_compact_json() -> None:
     assert request_log.json_size(object()) is not None  # default=str fallback
 
 
-def test_litellm_success_carries_sizes_finish_reason_and_rate_limit() -> None:
+def test_litellm_success_carries_sizes_finish_reason_headers_and_details() -> None:
     kwargs = _anthropic_kwargs(
         None,
         headers={
             "request-id": "req_ok",
             "anthropic-ratelimit-requests-remaining": "49",
             "anthropic-ratelimit-tokens-remaining": "39000",
+            "anthropic-organization-id": "org-123",
             "x-api-key": "sk-ant-secret",
         },
     )
-    kwargs["optional_params"] = {"max_tokens": 4096, "temperature": 0}
+    kwargs["optional_params"] = {
+        "max_tokens": 4096,
+        "temperature": 0,
+        "tools": [{"name": "a"}, {"name": "b"}],
+        "extra_headers": {"authorization": "Bearer x"},
+    }
+    kwargs["standard_logging_object"]["hidden_params"]["model_id"] = "m-1"
+    kwargs["standard_logging_object"]["cache_hit"] = False
 
     class _Choice:
         finish_reason = "tool_calls"
+        provider_specific_fields: ClassVar[dict[str, Any]] = {"stop_sequence": None}
 
     class _Response(_FakeResponse):
         choices: ClassVar[list[Any]] = [_Choice()]
+        system_fingerprint = "fp_1"
 
     event = request_log.event_from_litellm(kwargs, _Response(), None, None, outcome="success")
 
@@ -485,18 +583,54 @@ def test_litellm_success_carries_sizes_finish_reason_and_rate_limit() -> None:
             "messages": [{"role": "user", "content": "SECRET PROMPT"}],
             "max_tokens": 4096,
             "temperature": 0,
+            "tools": [{"name": "a"}, {"name": "b"}],
+            "extra_headers": {"authorization": "Bearer x"},
         }
     )
     assert event.request_bytes == expected_request
     assert event.response_bytes is not None and event.response_bytes > 0
     assert event.finish_reason == "tool_calls"
-    assert event.rate_limit == {
+    assert event.response_headers == {
+        "request-id": "req_ok",
         "anthropic-ratelimit-requests-remaining": "49",
         "anthropic-ratelimit-tokens-remaining": "39000",
+        "anthropic-organization-id": "org-123",
+    }
+    assert event.details is not None
+    assert event.details["request"] == {
+        "max_tokens": 4096,
+        "temperature": 0,
+        "message_count": 1,
+        "tool_count": 2,
+    }
+    assert event.details["response"]["id"] == "msg_01abc"
+    assert event.details["response"]["system_fingerprint"] == "fp_1"
+    assert event.details["response"]["usage"]["cache_read_input_tokens"] == 100
+    assert event.details["response"]["choice"] == {"finish_reason": "tool_calls"}
+    assert event.details["response"]["choice_count"] == 1
+    assert event.details["litellm"] == {
+        "response_cost": 0.0123,
+        "model_id": "m-1",
+        "cache_hit": False,
     }
     assert event.time_to_first_token_ms is None
+    assert event.request_body is None and event.response_body is None
     assert "sk-ant-secret" not in str(event.to_dict())
     assert "SECRET PROMPT" not in str(event.to_dict())
+    assert "SECRET COMPLETION" not in str(event.to_dict())
+    assert "Bearer" not in str(event.to_dict())
+
+
+def test_litellm_request_size_prefers_the_provider_payload_litellm_built() -> None:
+    kwargs = _anthropic_kwargs(None)
+    payload = {"model": "claude-sonnet-4-5", "system": "S", "messages": [], "max_tokens": 1}
+    kwargs["additional_args"] = {
+        "complete_input_dict": payload,
+        "headers": {"x-api-key": "sk-ant-secret"},
+    }
+    event = request_log.event_from_litellm(kwargs, _FakeResponse(), None, None, outcome="success")
+    assert event.request_bytes == request_log.json_size(payload)
+    assert "sk-ant-secret" not in str(event.to_dict())
 
 
 def test_litellm_streaming_time_to_first_token_from_completion_start() -> None:
@@ -517,7 +651,7 @@ def test_litellm_streaming_time_to_first_token_from_completion_start() -> None:
     assert no_first.time_to_first_token_ms is None
 
 
-def test_litellm_failure_carries_status_body_size_and_rate_limit_from_exception() -> None:
+def test_litellm_failure_carries_status_body_size_headers_and_error_details() -> None:
     body = '{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}'
     exc = _anthropic_error(
         429,
@@ -526,6 +660,7 @@ def test_litellm_failure_carries_status_body_size_and_rate_limit_from_exception(
             "request-id": "req_429",
             "retry-after": "7",
             "anthropic-ratelimit-requests-remaining": "0",
+            "content-type": "application/json",
             "x-api-key": "sk-ant-secret",
         },
     )
@@ -538,20 +673,25 @@ def test_litellm_failure_carries_status_body_size_and_rate_limit_from_exception(
     assert event.provider_request_id == "req_429"
     assert event.request_bytes is not None and event.request_bytes > 0
     assert event.response_bytes == len(body.encode())
-    assert event.rate_limit == {
+    assert event.response_headers == {
+        "request-id": "req_429",
         "retry-after": "7",
         "anthropic-ratelimit-requests-remaining": "0",
+        "content-type": "application/json",
     }
+    assert event.details is not None
+    assert event.details["request"] == {"max_tokens": 10, "message_count": 1}
+    assert event.details["error"]["llm_provider"] == "anthropic"
     assert event.finish_reason is None
     assert "sk-ant-secret" not in str(event.to_dict())
 
 
-def test_litellm_failure_without_headers_has_no_rate_limit() -> None:
+def test_litellm_failure_without_headers_has_no_headers() -> None:
     exc = APITimeoutError(httpx.Request("POST", "https://api.anthropic.com/v1/messages"))
     kwargs = _anthropic_kwargs(exc)
     kwargs["standard_logging_object"]["error_information"]["error_code"] = ""
     event = request_log.event_from_litellm(kwargs, None, None, None, outcome="error")
-    assert event.rate_limit is None
+    assert event.response_headers is None
     assert event.response_bytes is not None  # size of the timeout message text
 
 
@@ -568,10 +708,83 @@ def test_to_dict_and_log_line_include_new_fields() -> None:
         "response_bytes",
         "time_to_first_token_ms",
         "finish_reason",
-        "rate_limit",
+        "response_headers",
+        "details",
+        "request_body_truncated",
+        "response_body_truncated",
     ):
         assert key in data
+    assert "request_body" not in data
+    assert "response_body" not in data
+    assert "rate_limit" not in data
     assert data["time_to_first_token_ms"] == 100
+
+
+# --------------------------------------------------------------------------- #
+# opt-in raw bodies                                                            #
+# --------------------------------------------------------------------------- #
+
+
+def test_bodies_are_off_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(request_log.CAPTURE_BODIES_ENV, raising=False)
+    assert request_log.bodies_enabled() is False
+    for value in ("0", "false", "no", "", "maybe"):
+        monkeypatch.setenv(request_log.CAPTURE_BODIES_ENV, value)
+        assert request_log.bodies_enabled() is False
+    for value in ("1", "true", "YES", " on "):
+        monkeypatch.setenv(request_log.CAPTURE_BODIES_ENV, value)
+        assert request_log.bodies_enabled() is True
+
+
+def test_litellm_bodies_captured_only_when_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    kwargs = _anthropic_kwargs(None, headers={"request-id": "req_ok"})
+    payload = {
+        "model": "claude-sonnet-4-5",
+        "system": "SYSTEM",
+        "messages": [
+            {"role": "user", "content": "SECRET PROMPT sk-ant-api03-abcdefghijklmnopqrstu"}
+        ],
+    }
+    kwargs["additional_args"] = {"complete_input_dict": payload}
+    kwargs["original_response"] = '{"id":"msg_01abc","content":[{"text":"SECRET COMPLETION"}]}'
+
+    monkeypatch.delenv(request_log.CAPTURE_BODIES_ENV, raising=False)
+    off = request_log.event_from_litellm(kwargs, _FakeResponse(), None, None, outcome="success")
+    assert off.request_body is None and off.response_body is None
+    assert off.has_bodies is False
+
+    monkeypatch.setenv(request_log.CAPTURE_BODIES_ENV, "true")
+    on = request_log.event_from_litellm(kwargs, _FakeResponse(), None, None, outcome="success")
+    assert on.has_bodies is True
+    assert on.request_body is not None and "SECRET PROMPT" in on.request_body
+    assert "sk-ant-api03" not in on.request_body
+    assert on.response_body == kwargs["original_response"]
+    assert on.request_body_truncated is False and on.response_body_truncated is False
+    # The bodies never travel with the row-shaped view or the log line.
+    assert "SECRET PROMPT" not in str(on.to_dict())
+    assert "SECRET COMPLETION" not in str(on.to_dict())
+    assert "SECRET" not in repr(on)
+
+
+def test_litellm_failure_body_is_the_error_body(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(request_log.CAPTURE_BODIES_ENV, "1")
+    exc = _anthropic_error(400, ANTHROPIC_BLOCK_BODY, {"request-id": "req_b"})
+    kwargs = _anthropic_kwargs(exc)
+    event = request_log.event_from_litellm(kwargs, None, None, None, outcome="error")
+    assert event.response_body is not None
+    assert "content filtering policy" in event.response_body
+    assert event.request_body is not None and "SECRET PROMPT" in event.request_body
+
+
+def test_bodies_are_truncated_at_the_configured_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(request_log.CAPTURE_BODIES_ENV, "1")
+    monkeypatch.setenv(request_log.BODY_MAX_BYTES_ENV, "64")
+    text, truncated = request_log.body_text({"content": "é" * 500})
+    assert truncated is True
+    assert text is not None and len(text.encode("utf-8")) <= 64
+    monkeypatch.setenv(request_log.BODY_MAX_BYTES_ENV, "not-a-number")
+    assert request_log.body_max_bytes() == request_log.DEFAULT_BODY_MAX_BYTES
+    assert request_log.body_text(None) == (None, False)
 
 
 # --------------------------------------------------------------------------- #
@@ -813,12 +1026,44 @@ async def test_openai_route_success_carries_request_and_response_sizes(
     assert event.response_bytes == request_log.json_size([])
     assert event.time_to_first_token_ms is None
     assert event.finish_reason is None
-    assert event.rate_limit is None
+    assert event.response_headers is None
+    assert event.details is not None
+    assert event.details["request"]["tool_count"] == 1
+    assert event.details["request"]["input_items"] == 1
+    assert event.details["response"]["usage"]["input_tokens"] == 10
+    assert event.request_body is None
     assert "SYSTEM SECRET INSTRUCTIONS" not in str(event.to_dict())
 
 
 @pytest.mark.asyncio
-async def test_openai_route_error_carries_rate_limit_headers_and_body_size(
+async def test_openai_route_bodies_when_enabled(
+    captured: list[LlmRequestEvent], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(request_log.CAPTURE_BODIES_ENV, "1")
+    created = ResponseCreatedEvent(
+        response=_completed_event("resp_body").response,
+        sequence_number=0,
+        type="response.created",
+    )
+    model = request_log.RequestLoggingModel(
+        _Inner(stream_events=[created, _completed_event("resp_body")]),
+        model_name="gpt-5",
+        provider="openai",
+        base_url=None,
+    )
+    args = list(_CALL_ARGS)
+    args[0] = "SYSTEM SECRET INSTRUCTIONS"
+    async for _ in model.stream_response(*args, **_CALL_KWARGS):
+        pass
+    event = captured[0]
+    assert event.request_body is not None and "SYSTEM SECRET INSTRUCTIONS" in event.request_body
+    assert event.response_body is not None and '"id":"resp_body"' in event.response_body
+    assert event.details is not None and event.details["response"]["id"] == "resp_body"
+    assert "SYSTEM SECRET INSTRUCTIONS" not in str(event.to_dict())
+
+
+@pytest.mark.asyncio
+async def test_openai_route_error_carries_response_headers_and_body_size(
     captured: list[LlmRequestEvent],
 ) -> None:
     request = httpx.Request("POST", "https://api.openai.com/v1/responses")
@@ -846,14 +1091,19 @@ async def test_openai_route_error_carries_rate_limit_headers_and_body_size(
     event = captured[0]
     assert event.status_code == 429
     assert event.provider_request_id == "req_429_openai"
-    assert event.rate_limit == {
+    assert event.response_headers == {
+        "x-request-id": "req_429_openai",
         "x-ratelimit-limit-tokens": "30000",
         "x-ratelimit-remaining-tokens": "0",
         "x-ratelimit-reset-tokens": "6ms",
         "retry-after": "1",
+        "openai-organization": "org-secret",
+        "content-length": str(len(body.encode())),
+        "content-type": "text/plain; charset=utf-8",
     }
     assert event.response_bytes is not None and event.response_bytes > 0
-    assert "org-secret" not in str(event.to_dict())
+    assert event.details is not None
+    assert event.details["request"]["tool_count"] == 0
 
 
 @pytest.mark.asyncio

@@ -7,8 +7,18 @@ Events carry the provider's own request identifier when the provider returns
 one (Anthropic ``request-id``, OpenAI ``x-request-id``), which is what a
 provider's support team asks for when a call was blocked or misbehaved.
 
-The record deliberately holds no prompt, completion, header block, or
-credential. Error text is redacted and truncated before it is stored.
+The typed fields are the common ground every provider shares (status, ids,
+timing, sizes, tokens, cost). Everything else a provider or SDK reports about
+the attempt travels free-form: the response headers minus credential-bearing
+names, and a ``details`` object with the request parameters, the full usage
+object, the SDK's hidden parameters and the error body. Content (prompts,
+completions, tool arguments) and credentials are removed from both, values are
+redacted and every string, list and object is bounded.
+
+The raw request and response bodies are captured only when the deployment opts
+in (``STRIX_LLM_REQUEST_LOG_CAPTURE_BODIES``); they never appear in the log
+line or in :meth:`LlmRequestEvent.to_dict`, a persistence sink has to store them
+on purpose.
 
 Sinks are plain callables. The built-in sink writes one log line per event;
 deployments register their own (a database, a queue) with
@@ -19,15 +29,17 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import json
 import logging
+import os
 import re
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextvars import ContextVar, Token
-from dataclasses import asdict, dataclass, replace
-from datetime import UTC, datetime
+from dataclasses import asdict, dataclass, field, replace
+from datetime import UTC, date, datetime
 from typing import TYPE_CHECKING, Any, Literal, cast
 from urllib.parse import urlsplit
 
@@ -57,6 +69,10 @@ Outcome = Literal["success", "error"]
 Route = Literal["litellm", "openai"]
 
 ERROR_MESSAGE_MAX_CHARS = 2000
+
+CAPTURE_BODIES_ENV = "STRIX_LLM_REQUEST_LOG_CAPTURE_BODIES"
+BODY_MAX_BYTES_ENV = "STRIX_LLM_REQUEST_LOG_BODY_MAX_BYTES"
+DEFAULT_BODY_MAX_BYTES = 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -101,14 +117,30 @@ class LlmRequestEvent:
     # Streamed calls only.
     time_to_first_token_ms: int | None = None
     finish_reason: str | None = None
-    # ``x-ratelimit-*`` / ``anthropic-ratelimit-*`` / ``retry-after`` only, never other headers.
-    rate_limit: dict[str, str] | None = None
+    # Every response header the provider sent, name-normalized, minus
+    # credential-bearing names; values redacted and capped.
+    response_headers: dict[str, str] | None = None
+    # Free-form: request parameters, full usage object, SDK hidden params,
+    # error body ... with content and credentials removed and sizes bounded.
+    details: dict[str, Any] | None = None
+    # Opt-in only (STRIX_LLM_REQUEST_LOG_CAPTURE_BODIES). Redacted JSON text.
+    request_body: str | None = field(default=None, repr=False)
+    response_body: str | None = field(default=None, repr=False)
+    request_body_truncated: bool = False
+    response_body_truncated: bool = False
 
     def to_dict(self) -> dict[str, Any]:
+        """The row-shaped view: everything except the raw bodies."""
         data = asdict(self)
+        data.pop("request_body", None)
+        data.pop("response_body", None)
         data["started_at"] = self.started_at.isoformat()
         data["finished_at"] = self.finished_at.isoformat()
         return data
+
+    @property
+    def has_bodies(self) -> bool:
+        return self.request_body is not None or self.response_body is not None
 
 
 LlmRequestSink = Callable[[LlmRequestEvent], None]
@@ -245,20 +277,91 @@ def request_id_from_text(text: str | None) -> str | None:
     return match.group(1) if match else None
 
 
-# Rate-limit telemetry a provider puts in response headers. Names are
-# normalized to lowercase with hyphens before matching; LiteLLM stores them
-# both as ``x_ratelimit_remaining_tokens`` and ``llm_provider-…`` keys.
-_RATE_LIMIT_HEADER_PREFIXES: tuple[str, ...] = (
-    "x-ratelimit-",
-    "anthropic-ratelimit-",
-    "retry-after",
-)
-RATE_LIMIT_MAX_HEADERS = 24
+# --------------------------------------------------------------------------- #
+# Free-form telemetry: response headers, details, raw bodies                   #
+# --------------------------------------------------------------------------- #
+
 FINISH_REASON_MAX_CHARS = 128
 
+# Response headers are kept whole, except names that carry a credential. The
+# list is a deny-list on purpose: a provider's new telemetry header should show
+# up without a code change, a leaked credential must not.
+_DENIED_HEADER_FRAGMENTS: tuple[str, ...] = (
+    "auth",  # authorization, proxy-authorization, www-authenticate, x-auth-token
+    "cookie",
+    "api-key",
+    "apikey",
+    "secret",
+    "password",
+    "credential",
+    "signature",
+    "session",
+)
+HEADERS_MAX_COUNT = 64
+HEADER_VALUE_MAX_CHARS = 512
 
-def rate_limit_from_headers(headers: Mapping[str, Any] | None) -> dict[str, str] | None:
-    """Only the rate-limit headers, name-normalized. Never the whole header block."""
+# Keys of a request/response structure whose value is content: the prompt, the
+# completion, tool schemas and arguments. ``details`` is metadata about the
+# exchange, never the exchange itself; the bodies are a separate opt-in.
+_CONTENT_KEYS: frozenset[str] = frozenset(
+    {
+        "messages",
+        "message",
+        "content",
+        "text",
+        "input",
+        "output",
+        "instructions",
+        "system",
+        "prompt",
+        "completion",
+        "choices",
+        "delta",
+        "tool_calls",
+        "function_call",
+        "arguments",
+        "tools",
+        "functions",
+        "thinking_blocks",
+        "reasoning_content",
+        "citations",
+        "image_url",
+        "data",
+        "b64_json",
+        "embedding",
+        "audio",
+        "complete_input_dict",
+        "original_response",
+    }
+)
+# Keys whose value is or may hold a credential, whatever the provider calls it.
+_SECRET_KEY_FRAGMENTS: tuple[str, ...] = (
+    "api_key",
+    "api-key",
+    "apikey",
+    "authorization",
+    "secret",
+    "password",
+    "credential",
+    "cookie",
+    "headers",  # request header blocks carry the auth header
+    "access_token",
+    "refresh_token",
+    "id_token",
+    "bearer",
+)
+DETAILS_MAX_BYTES = 16 * 1024
+DETAILS_MAX_DEPTH = 6
+DETAILS_MAX_ITEMS = 32
+DETAILS_MAX_STRING = 256
+
+
+def _normalize_header_name(key: object) -> str:
+    return str(key).lower().removeprefix(_LITELLM_HEADER_PREFIX).replace("_", "-").strip()
+
+
+def headers_from_response(headers: Mapping[str, Any] | None) -> dict[str, str] | None:
+    """The provider's response headers, minus credential-bearing names, redacted and capped."""
     if not headers:
         return None
     picked: dict[str, str] = {}
@@ -268,27 +371,142 @@ def rate_limit_from_headers(headers: Mapping[str, Any] | None) -> dict[str, str]
         text = str(value).strip()
         if not text:
             continue
-        name = str(key).lower().removeprefix(_LITELLM_HEADER_PREFIX).replace("_", "-")
-        if not name.startswith(_RATE_LIMIT_HEADER_PREFIXES):
+        name = _normalize_header_name(key)
+        if not name or any(fragment in name for fragment in _DENIED_HEADER_FRAGMENTS):
             continue
-        picked.setdefault(name, text[:64])
-        if len(picked) >= RATE_LIMIT_MAX_HEADERS:
+        picked.setdefault(name, redact(text)[:HEADER_VALUE_MAX_CHARS])
+        if len(picked) >= HEADERS_MAX_COUNT:
             break
     return picked or None
 
 
-def json_size(value: object) -> int | None:
-    """Byte length of ``value`` serialized as compact JSON; None when it cannot be serialized."""
+def _strip_url_secrets(text: str) -> str:
+    """Drop the query and fragment of anything URL-shaped; gateways key on them."""
+    if "://" not in text:
+        return text
+    try:
+        parts = urlsplit(text)
+    except ValueError:
+        return text
+    return parts._replace(query="", fragment="").geturl()
+
+
+def _sanitize_value(value: object, depth: int) -> object:  # noqa: PLR0911
+    if value is None or isinstance(value, bool | int | float):
+        return value
+    if isinstance(value, str):
+        return redact(_strip_url_secrets(value))[:DETAILS_MAX_STRING]
+    if isinstance(value, datetime | date):
+        return value.isoformat()
+    if depth >= DETAILS_MAX_DEPTH:
+        return "…"
+    if isinstance(value, BaseModel):
+        return _sanitize_value(value.model_dump(exclude_none=True), depth)
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return _sanitize_value(dataclasses.asdict(value), depth)
+    if isinstance(value, Mapping):
+        out: dict[str, object] = {}
+        for raw_key, item in cast("Mapping[object, object]", value).items():
+            key = str(raw_key)
+            lowered = key.lower()
+            if lowered in _CONTENT_KEYS or any(f in lowered for f in _SECRET_KEY_FRAGMENTS):
+                continue
+            cleaned = _sanitize_value(item, depth + 1)
+            if cleaned is None or cleaned in ({}, []):
+                continue
+            out[key[:DETAILS_MAX_STRING]] = cleaned
+            if len(out) >= DETAILS_MAX_ITEMS:
+                break
+        return out
+    if isinstance(value, Sequence | set | frozenset):
+        items = list(cast("Sequence[object]", value))[:DETAILS_MAX_ITEMS]
+        return [_sanitize_value(item, depth + 1) for item in items]
+    return redact(str(value))[:DETAILS_MAX_STRING]
+
+
+def sanitize_details(value: object) -> dict[str, Any] | None:
+    """A bounded, content-free, credential-free copy of ``value`` (a mapping), or None.
+
+    Content keys and secret-shaped keys are dropped by name, strings are
+    redacted and capped, nesting, item counts and total size are bounded. When
+    the copy is still too large the biggest top-level entries go first and
+    their names are listed under ``_dropped``.
+    """
+    cleaned = _sanitize_value(value, 0)
+    if not isinstance(cleaned, dict):
+        return None
+    details = cast("dict[str, Any]", cleaned)
+    details = {k: v for k, v in details.items() if v not in (None, {}, [])}
+    if not details:
+        return None
+    size = json_size(details) or 0
+    if size <= DETAILS_MAX_BYTES:
+        return details
+    dropped: list[str] = []
+    by_size = sorted(details, key=lambda k: json_size(details[k]) or 0, reverse=True)
+    for key in by_size:
+        if size <= DETAILS_MAX_BYTES:
+            break
+        size -= json_size(details.pop(key)) or 0
+        dropped.append(key)
+    details["_dropped"] = dropped
+    return details
+
+
+def merge_details(*parts: tuple[str, object]) -> dict[str, Any] | None:
+    """``{name: sanitize(value)}`` for every non-empty part, bounded as one object."""
+    merged: dict[str, Any] = {}
+    for name, value in parts:
+        if value is None:
+            continue
+        merged[name] = value
+    return sanitize_details(merged)
+
+
+def bodies_enabled() -> bool:
+    return os.getenv(CAPTURE_BODIES_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def body_max_bytes() -> int:
+    raw = os.getenv(BODY_MAX_BYTES_ENV, "").strip()
+    if raw.isdigit() and int(raw) > 0:
+        return int(raw)
+    return DEFAULT_BODY_MAX_BYTES
+
+
+def json_text(value: object) -> str | None:
+    """``value`` as compact JSON text; None when it cannot be serialized."""
     if value is None:
         return None
     try:
         if isinstance(value, BaseModel):
-            text = value.model_dump_json(exclude_none=True)
-        else:
-            text = json.dumps(value, default=str, separators=(",", ":"), ensure_ascii=False)
-    except Exception:  # noqa: BLE001 - size is best-effort telemetry
+            return value.model_dump_json(exclude_none=True)
+        if isinstance(value, str):
+            return value
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="replace")
+        return json.dumps(value, default=str, separators=(",", ":"), ensure_ascii=False)
+    except Exception:  # noqa: BLE001 - telemetry is best-effort
         return None
-    return len(text.encode("utf-8"))
+
+
+def body_text(value: object) -> tuple[str | None, bool]:
+    """``(redacted body text, truncated)``, bounded at :func:`body_max_bytes`."""
+    text = json_text(value)
+    if text is None:
+        return None, False
+    limit = body_max_bytes()
+    encoded = text.encode("utf-8")
+    truncated = len(encoded) > limit
+    if truncated:
+        text = encoded[:limit].decode("utf-8", errors="ignore")
+    return redact(text), truncated
+
+
+def json_size(value: object) -> int | None:
+    """Byte length of ``value`` serialized as compact JSON; None when it cannot be serialized."""
+    text = json_text(value)
+    return None if text is None else len(text.encode("utf-8"))
 
 
 def api_host(url: str | None) -> str | None:
@@ -373,8 +591,17 @@ def _litellm_finish_reason(response: object) -> str | None:
     return _finish_reason(getattr(first, "finish_reason", None))
 
 
-def _litellm_request_size(kwargs: Mapping[str, Any]) -> int | None:
-    """Size of the request as LiteLLM sent it: model, messages and the provider params."""
+def _litellm_request_body(kwargs: Mapping[str, Any]) -> object:
+    """The request as LiteLLM sent it.
+
+    The provider payload LiteLLM built (``additional_args.complete_input_dict``)
+    when the adapter recorded it; otherwise model, messages and the provider
+    params, which is the same information before translation.
+    """
+    additional = _mapping(kwargs.get("additional_args"))
+    payload = _mapping(additional.get("complete_input_dict")) if additional else None
+    if payload:
+        return payload
     body: dict[str, Any] = {"model": kwargs.get("model")}
     messages = kwargs.get("messages")
     if messages is not None:
@@ -382,7 +609,52 @@ def _litellm_request_size(kwargs: Mapping[str, Any]) -> int | None:
     optional = _mapping(kwargs.get("optional_params"))
     if optional:
         body.update(optional)
-    return json_size(body)
+    return body
+
+
+def _litellm_response_body(kwargs: Mapping[str, Any], response: object) -> object:
+    """The provider's own response text when LiteLLM kept it, else its normalized response."""
+    original = kwargs.get("original_response")
+    if isinstance(original, str) and original.strip():
+        return original
+    return response
+
+
+def _count(value: object) -> int | None:
+    return len(cast("Sequence[object]", value)) if isinstance(value, Sequence | Mapping) else None
+
+
+def _litellm_request_details(kwargs: Mapping[str, Any]) -> dict[str, Any]:
+    optional = _mapping(kwargs.get("optional_params")) or {}
+    request: dict[str, Any] = dict(optional)
+    counts = {
+        "message_count": _count(kwargs.get("messages")),
+        "tool_count": _count(optional.get("tools") or optional.get("functions")),
+    }
+    request.update({k: v for k, v in counts.items() if v is not None})
+    return request
+
+
+def _exception_details(exc: BaseException | None) -> dict[str, Any] | None:
+    """What the SDK exception says beyond its message: the error body and its typed fields."""
+    if exc is None:
+        return None
+    error: dict[str, Any] = {}
+    body = getattr(exc, "body", None)
+    if isinstance(body, Mapping | str):
+        error["body"] = body if isinstance(body, Mapping) else _mapping(_parse_json(body)) or body
+    for name in ("code", "param", "type", "llm_provider", "max_retries", "num_retries"):
+        value = getattr(exc, name, None)
+        if isinstance(value, str | int) and not isinstance(value, bool):
+            error[name] = value
+    return error or None
+
+
+def _parse_json(text: str) -> object:
+    try:
+        return json.loads(text)
+    except ValueError:
+        return None
 
 
 def _exception_headers(exc: BaseException | None) -> Mapping[str, Any] | None:
@@ -411,14 +683,17 @@ def _exception_headers(exc: BaseException | None) -> Mapping[str, Any] | None:
     return first
 
 
-def _exception_body_size(exc: BaseException) -> int | None:
+def _exception_body(exc: BaseException) -> object:
+    """The response body an SDK exception carries, else its message text."""
     body = getattr(exc, "body", None)
-    size = json_size(body) if body is not None else None
-    if size is not None:
-        return size
+    if body is not None:
+        return body
     text = getattr(exc, "message", None)
-    text = text if isinstance(text, str) and text else str(exc)
-    return len(text.encode("utf-8")) if text else None
+    return text if isinstance(text, str) and text else str(exc)
+
+
+def _exception_body_size(exc: BaseException) -> int | None:
+    return json_size(_exception_body(exc))
 
 
 def _headers_mapping(headers: object) -> Mapping[str, Any] | None:
@@ -469,8 +744,9 @@ def event_from_litellm(
     request_id = request_id_from_headers(response_headers) or request_id_from_headers(
         hidden_headers
     )
-    rate_limit = rate_limit_from_headers(response_headers) or rate_limit_from_headers(
-        hidden_headers
+    headers = headers_from_response(response_headers) or headers_from_response(hidden_headers)
+    request_body, request_truncated = (
+        body_text(_litellm_request_body(kwargs)) if bodies_enabled() else (None, False)
     )
 
     ttft_ms: int | None = None
@@ -500,22 +776,67 @@ def event_from_litellm(
         agent_id=context.agent_id,
         agent_name=context.agent_name,
         retry_attempt=context.retry_attempt,
-        request_bytes=_litellm_request_size(kwargs),
+        request_bytes=json_size(_litellm_request_body(kwargs)),
         time_to_first_token_ms=ttft_ms,
-        rate_limit=rate_limit,
+        response_headers=headers,
+        request_body=request_body,
+        request_body_truncated=request_truncated,
     )
     if outcome == "success":
-        return _litellm_success(base, kwargs, response, hidden)
-    return _litellm_failure(base, exc, error_info, slo)
+        return _litellm_success(base, kwargs, response, hidden, slo)
+    return _litellm_failure(base, kwargs, exc, error_info, slo)
+
+
+def _litellm_response_details(response: object) -> dict[str, Any] | None:
+    """Everything LiteLLM's normalized response says about the call except the choices."""
+    if isinstance(response, BaseModel):
+        summary: dict[str, Any] = response.model_dump(exclude={"choices"}, exclude_none=True)
+    else:
+        summary = {}
+        for name in ("id", "created", "model", "object", "system_fingerprint", "service_tier"):
+            value = getattr(response, name, None)
+            if value is not None:
+                summary[name] = value
+        usage = getattr(response, "usage", None)
+        if usage is not None:
+            summary["usage"] = usage
+    choices = getattr(response, "choices", None)
+    if isinstance(choices, list) and choices:
+        first: object = cast("list[object]", choices)[0]
+        summary["choice"] = {
+            "finish_reason": getattr(first, "finish_reason", None),
+            "provider_specific_fields": getattr(first, "provider_specific_fields", None),
+        }
+        summary["choice_count"] = len(cast("list[object]", choices))
+    return summary or None
+
+
+def _litellm_hidden_details(hidden: Mapping[str, Any], slo: Mapping[str, Any]) -> dict[str, Any]:
+    """LiteLLM's own bookkeeping for the call (model id, cache hit, overhead, cost basis)."""
+    litellm_info: dict[str, Any] = {
+        k: v for k, v in hidden.items() if k not in {"additional_headers", "api_base"}
+    }
+    for name in ("cache_hit", "saved_cache_cost", "model_group", "model_id"):
+        value = slo.get(name)
+        if value is not None:
+            litellm_info.setdefault(name, value)
+    return litellm_info
 
 
 def _litellm_success(
-    base: LlmRequestEvent, kwargs: Mapping[str, Any], response: object, hidden: Mapping[str, Any]
+    base: LlmRequestEvent,
+    kwargs: Mapping[str, Any],
+    response: object,
+    hidden: Mapping[str, Any],
+    slo: Mapping[str, Any],
 ) -> LlmRequestEvent:
     usage = _litellm_usage(response)
     cost = _float_or_none(kwargs.get("response_cost"))
     if cost is None:
         cost = _float_or_none(hidden.get("response_cost"))
+    response_body, response_truncated = (
+        body_text(_litellm_response_body(kwargs, response)) if bodies_enabled() else (None, False)
+    )
     return replace(
         base,
         status_code=200,
@@ -527,11 +848,19 @@ def _litellm_success(
         cost_usd=cost,
         response_bytes=json_size(response),
         finish_reason=_litellm_finish_reason(response),
+        details=merge_details(
+            ("request", _litellm_request_details(kwargs)),
+            ("response", _litellm_response_details(response)),
+            ("litellm", _litellm_hidden_details(hidden, slo)),
+        ),
+        response_body=response_body,
+        response_body_truncated=response_truncated,
     )
 
 
 def _litellm_failure(
     base: LlmRequestEvent,
+    kwargs: Mapping[str, Any],
     exc: BaseException | None,
     error_info: Mapping[str, Any],
     slo: Mapping[str, Any],
@@ -540,16 +869,20 @@ def _litellm_failure(
     error_type: str | None = None
     error_message: str | None = None
     request_id = base.provider_request_id
-    rate_limit = base.rate_limit
+    headers = base.response_headers
     response_bytes: int | None = None
+    response_body: str | None = None
+    response_truncated = False
     if exc is not None:
         status_code = _int_or_none(getattr(exc, "status_code", None))
         error_type = type(exc).__name__
         error_message = clean_error_message(exc)
         exc_headers = _exception_headers(exc)
         request_id = request_id or request_id_from_headers(exc_headers)
-        rate_limit = rate_limit or rate_limit_from_headers(exc_headers)
+        headers = headers or headers_from_response(exc_headers)
         response_bytes = _exception_body_size(exc)
+        if bodies_enabled():
+            response_body, response_truncated = body_text(_exception_body(exc))
     if status_code is None:
         code = error_info.get("error_code")
         status_code = _int_or_none(code)
@@ -560,6 +893,7 @@ def _litellm_failure(
         raw = _str_or_none(error_info.get("error_message")) or _str_or_none(slo.get("error_str"))
         error_message = redact(raw)[:ERROR_MESSAGE_MAX_CHARS] if raw else error_type
     request_id = request_id or request_id_from_text(error_message)
+    hidden = _mapping(slo.get("hidden_params")) or {}
     return replace(
         base,
         status_code=status_code,
@@ -567,7 +901,14 @@ def _litellm_failure(
         error_type=error_type,
         error_message=error_message,
         response_bytes=response_bytes,
-        rate_limit=rate_limit,
+        response_headers=headers,
+        details=merge_details(
+            ("request", _litellm_request_details(kwargs)),
+            ("error", _exception_details(exc) or dict(error_info) or None),
+            ("litellm", _litellm_hidden_details(hidden, slo)),
+        ),
+        response_body=response_body,
+        response_body_truncated=response_truncated,
     )
 
 
@@ -732,9 +1073,10 @@ class RequestLoggingModel(Model):
         streaming: bool,
         response: ModelResponse | None,
         exc: BaseException | None,
-        request_bytes: int | None = None,
+        request: _OpenAiRequest,
         first_event_mono: float | None = None,
         finish_reason: str | None = None,
+        raw_response: object = None,
     ) -> LlmRequestEvent:
         finished = datetime.now(UTC)
         duration_ms = max(0, int((time.monotonic() - started_mono) * 1000))
@@ -763,13 +1105,23 @@ class RequestLoggingModel(Model):
             agent_id=context.agent_id,
             agent_name=context.agent_name,
             retry_attempt=context.retry_attempt,
-            request_bytes=request_bytes,
+            request_bytes=request.size,
             time_to_first_token_ms=ttft_ms,
             finish_reason=finish_reason,
+            request_body=request.body,
+            request_body_truncated=request.truncated,
         )
         if exc is None:
             usage = _openai_usage(response) if response is not None else {}
             response_id = response.response_id if response is not None else None
+            body_source = (
+                raw_response
+                if raw_response is not None
+                else (response.output if response is not None else None)
+            )
+            response_body, response_truncated = (
+                body_text(body_source) if bodies_enabled() else (None, False)
+            )
             return replace(
                 base,
                 response_id=response_id,
@@ -777,9 +1129,18 @@ class RequestLoggingModel(Model):
                 output_tokens=usage.get("output_tokens"),
                 cached_input_tokens=usage.get("cached_input_tokens"),
                 total_tokens=usage.get("total_tokens"),
-                response_bytes=json_size(response.output) if response is not None else None,
+                response_bytes=json_size(body_source),
+                details=merge_details(
+                    ("request", request.details),
+                    ("response", _openai_response_details(response, raw_response)),
+                ),
+                response_body=response_body,
+                response_body_truncated=response_truncated,
             )
         status, request_id = _openai_error_fields(exc)
+        response_body, response_truncated = (
+            body_text(_exception_body(exc)) if bodies_enabled() else (None, False)
+        )
         return replace(
             base,
             outcome="error",
@@ -788,15 +1149,25 @@ class RequestLoggingModel(Model):
             error_type=type(exc).__name__,
             error_message=clean_error_message(exc),
             response_bytes=_exception_body_size(exc),
-            rate_limit=rate_limit_from_headers(_openai_error_headers(exc)),
+            response_headers=headers_from_response(_openai_error_headers(exc)),
+            details=merge_details(
+                ("request", request.details),
+                ("error", _exception_details(exc)),
+            ),
+            response_body=response_body,
+            response_body_truncated=response_truncated,
         )
 
     @staticmethod
-    def _request_size(
+    def _request(
         system_instructions: str | None,
         input: object,  # noqa: A002
+        model_settings: ModelSettings,
         tools: list[Tool],
-    ) -> int | None:
+        *,
+        previous_response_id: str | None,
+        conversation_id: str | None,
+    ) -> _OpenAiRequest:
         serialized_tools = [
             {
                 "name": tool.name,
@@ -807,9 +1178,24 @@ class RequestLoggingModel(Model):
             else {"name": tool.name}
             for tool in tools
         ]
-        return json_size(
-            {"instructions": system_instructions, "input": input, "tools": serialized_tools}
-        )
+        body: dict[str, Any] = {
+            "instructions": system_instructions,
+            "input": input,
+            "tools": serialized_tools,
+        }
+        settings = _model_settings_dict(model_settings)
+        body.update({k: v for k, v in settings.items() if v is not None})
+        if previous_response_id:
+            body["previous_response_id"] = previous_response_id
+        if conversation_id:
+            body["conversation_id"] = conversation_id
+        details: dict[str, Any] = dict(settings)
+        details["input_items"] = _count(input) if not isinstance(input, str) else 1
+        details["tool_count"] = len(tools)
+        details["previous_response_id"] = previous_response_id
+        details["conversation_id"] = conversation_id
+        text, truncated = body_text(body) if bodies_enabled() else (None, False)
+        return _OpenAiRequest(size=json_size(body), details=details, body=text, truncated=truncated)
 
     async def get_response(
         self,
@@ -826,7 +1212,14 @@ class RequestLoggingModel(Model):
         prompt: ResponsePromptParam | None,
     ) -> ModelResponse:
         started, started_mono = datetime.now(UTC), time.monotonic()
-        request_bytes = self._request_size(system_instructions, input, tools)
+        request = self._request(
+            system_instructions,
+            input,
+            model_settings,
+            tools,
+            previous_response_id=previous_response_id,
+            conversation_id=conversation_id,
+        )
         try:
             response = await self._inner.get_response(
                 system_instructions,
@@ -850,7 +1243,7 @@ class RequestLoggingModel(Model):
                     streaming=False,
                     response=None,
                     exc=exc,
-                    request_bytes=request_bytes,
+                    request=request,
                 )
             )
             raise
@@ -861,7 +1254,7 @@ class RequestLoggingModel(Model):
                 streaming=False,
                 response=response,
                 exc=None,
-                request_bytes=request_bytes,
+                request=request,
             )
         )
         return response
@@ -881,8 +1274,16 @@ class RequestLoggingModel(Model):
         prompt: ResponsePromptParam | None,
     ) -> AsyncIterator[TResponseStreamEvent]:
         started, started_mono = datetime.now(UTC), time.monotonic()
-        request_bytes = self._request_size(system_instructions, input, tools)
+        request = self._request(
+            system_instructions,
+            input,
+            model_settings,
+            tools,
+            previous_response_id=previous_response_id,
+            conversation_id=conversation_id,
+        )
         completed: ModelResponse | None = None
+        raw_response: object = None
         first_event_mono: float | None = None
         finish_reason: str | None = None
         try:
@@ -914,6 +1315,7 @@ class RequestLoggingModel(Model):
                             output_tokens_details=raw_usage.output_tokens_details,
                         )
                     completed = ModelResponse(output=[], usage=usage, response_id=event.response.id)
+                    raw_response = event.response
                 yield event
         except asyncio.CancelledError:
             raise
@@ -925,7 +1327,7 @@ class RequestLoggingModel(Model):
                     streaming=True,
                     response=None,
                     exc=exc,
-                    request_bytes=request_bytes,
+                    request=request,
                     first_event_mono=first_event_mono,
                 )
             )
@@ -937,11 +1339,42 @@ class RequestLoggingModel(Model):
                 streaming=True,
                 response=completed,
                 exc=None,
-                request_bytes=request_bytes,
+                request=request,
                 first_event_mono=first_event_mono,
                 finish_reason=finish_reason,
+                raw_response=raw_response,
             )
         )
+
+
+@dataclass(frozen=True)
+class _OpenAiRequest:
+    """What the wrapper knows about one native request before it is sent."""
+
+    size: int | None
+    details: dict[str, Any]
+    body: str | None
+    truncated: bool
+
+
+def _model_settings_dict(model_settings: ModelSettings) -> dict[str, Any]:
+    try:
+        return dict(model_settings.to_json_dict())
+    except Exception:  # noqa: BLE001 - settings are telemetry here, never required
+        return {}
+
+
+def _openai_response_details(
+    response: ModelResponse | None, raw_response: object
+) -> dict[str, Any] | None:
+    """The Responses API object minus its output, or the SDK usage when that is all there is."""
+    if isinstance(raw_response, BaseModel):
+        return raw_response.model_dump(
+            exclude={"output", "instructions", "tools", "text"}, exclude_none=True
+        )
+    if response is None:
+        return None
+    return {"usage": response.usage, "output_items": len(response.output)}
 
 
 def _openai_finish_reason(event: ResponseCompletedEvent) -> str | None:
@@ -979,19 +1412,24 @@ __all__ = [
     "RequestLoggingModel",
     "api_host",
     "bind_call_context",
+    "bodies_enabled",
+    "body_text",
     "clean_error_message",
     "current_call_context",
     "emit",
     "event_from_litellm",
     "failure_text",
+    "headers_from_response",
     "install",
     "json_size",
-    "rate_limit_from_headers",
+    "json_text",
+    "merge_details",
     "redact",
     "register_sink",
     "request_id_from_headers",
     "request_id_from_text",
     "reset_call_context",
+    "sanitize_details",
     "set_retry_attempt",
     "unregister_sink",
 ]
