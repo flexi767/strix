@@ -36,10 +36,12 @@ from strix.tools.mcp import (
     attach_mcp_requests,
     call_mcp,
     describe_mcp,
+    get_mcp_tool_schema,
     list_mcps,
     load_user_mcp_configs,
     namespaced_tool_name,
     resolve_mcp_call,
+    search_mcp_tools,
 )
 from strix.tools.mcp import client as mcp_client
 from strix.tools.mcp import session as mcp_session_mod
@@ -434,8 +436,16 @@ async def test_list_mcps_returns_connections_with_ids_and_descriptions() -> None
                 "description": "local files",
                 "tool_count": 2,
                 "dead": False,
+                "state": "connected",
             },
-            {"id": "db", "name": "db", "description": None, "tool_count": 1, "dead": False},
+            {
+                "id": "db",
+                "name": "db",
+                "description": None,
+                "tool_count": 1,
+                "dead": False,
+                "state": "connected",
+            },
         ]
     }
 
@@ -483,6 +493,133 @@ async def test_describe_mcp_without_any_connections() -> None:
     out = await describe_mcp.on_invoke_tool(_ctx(None), json.dumps({"connection": "fs"}))
 
     assert out == "No MCP connections are configured for this run."
+
+
+@pytest.mark.asyncio
+async def test_search_then_get_one_schema_without_returning_other_schemas() -> None:
+    registry = McpRegistry()
+    registry.add(
+        name="docs",
+        server=FakeMCPServer(
+            "docs",
+            [
+                _mcp_tool("find_pages"),
+                MCPTool(
+                    name="fetch_page",
+                    description="Fetch page content",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {"page_id": {"type": "string"}},
+                    },
+                ),
+            ],
+        ),
+        config=McpConnectionConfig(
+            name="docs",
+            url="https://example.invalid/mcp",
+            active_tools=["fetch_page"],
+        ),
+    )
+
+    searched = await search_mcp_tools.on_invoke_tool(
+        _ctx(registry),
+        json.dumps({"connection": "docs", "query": "page content"}),
+    )
+    assert searched["matches"] == [
+        {
+            "name": "fetch_page",
+            "description": "Fetch page content",
+            "active": True,
+        }
+    ]
+    assert "input_schema" not in searched["matches"][0]
+
+    schema = await get_mcp_tool_schema.on_invoke_tool(
+        _ctx(registry),
+        json.dumps({"connection": "docs", "tool": "fetch_page"}),
+    )
+    assert schema["input_schema"]["properties"] == {"page_id": {"type": "string"}}
+
+
+@pytest.mark.asyncio
+async def test_registered_entry_connects_and_lists_once_for_concurrent_catalog_requests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = {"build": 0, "list": 0}
+
+    class _CountingServer(FakeMCPServer):
+        async def list_tools(
+            self,
+            run_context: Any = None,
+            agent: Any = None,
+        ) -> list[MCPTool]:
+            calls["list"] += 1
+            await asyncio.sleep(0)
+            return await super().list_tools(run_context, agent)
+
+    server = _CountingServer("docs", [_mcp_tool("fetch_page")])
+
+    def _build(_config: McpConnectionConfig) -> mcp_client.BuiltMcpServer:
+        calls["build"] += 1
+        return _built_server(server)
+
+    monkeypatch.setattr(mcp_client, "_build_server", _build)
+    registry = McpRegistry()
+    entry = registry.register(McpConnectionRequest(config=_config("docs", ["fetch_page"])))
+    assert entry.state == "configured"
+    assert calls == {"build": 0, "list": 0}
+
+    first, second = await asyncio.gather(entry.ensure_catalog(), entry.ensure_catalog())
+
+    assert [tool.name for tool in first] == ["fetch_page"]
+    assert second is first
+    assert calls == {"build": 1, "list": 1}
+    assert registry.statuses()[0].state == "catalog_ready"
+    await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_registry_warmup_bounds_parallel_connections(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    active = 0
+    maximum = 0
+    two_started = asyncio.Event()
+    release = asyncio.Event()
+
+    class _BlockedConnectServer(FakeMCPServer):
+        async def connect(self) -> None:
+            nonlocal active, maximum
+            active += 1
+            maximum = max(maximum, active)
+            if active == 2:
+                two_started.set()
+            try:
+                await release.wait()
+            finally:
+                active -= 1
+
+    servers = {
+        f"docs-{index}": _BlockedConnectServer(f"docs-{index}", [_mcp_tool("fetch_page")])
+        for index in range(4)
+    }
+    monkeypatch.setattr(
+        mcp_client,
+        "_build_server",
+        lambda config: _built_server(servers[config.name]),
+    )
+    registry = McpRegistry()
+    for name in servers:
+        registry.register(McpConnectionRequest(config=_config(name, ["fetch_page"])))
+
+    warmup = registry.start_warmup(max_concurrency=2)
+    await asyncio.wait_for(two_started.wait(), timeout=1)
+    assert maximum == 2
+    release.set()
+    await warmup
+
+    assert [summary.state for summary in registry.summaries()] == ["connected"] * 4
+    await registry.close()
 
 
 # --- call_mcp ----------------------------------------------------------------
@@ -634,18 +771,24 @@ async def test_call_mcp_flags_an_errored_result_failed_for_the_tui() -> None:
 # --- the two tools are the only MCP surface every agent gets -----------------
 
 
-def test_agent_carries_exactly_the_dispatch_tools_regardless_of_connections() -> None:
+def test_agent_carries_exactly_the_generic_mcp_tools_regardless_of_connections() -> None:
     """No matter how many MCP connections a run makes, an agent's tool list gains
-    exactly list_mcps, describe_mcp, and call_mcp and never a per-connection
-    provider tool."""
+    exactly the generic MCP tools and never a per-connection provider tool."""
     root = factory.build_strix_agent(is_root=True)
     child = factory.build_strix_agent(is_root=False)
 
     root_names = [t.name for t in root.tools]
     child_names = [t.name for t in child.tools]
 
-    assert {"list_mcps", "describe_mcp", "call_mcp"} <= set(root_names)
-    assert {"list_mcps", "describe_mcp", "call_mcp"} <= set(child_names)
+    expected = {
+        "list_mcps",
+        "search_mcp_tools",
+        "get_mcp_tool_schema",
+        "describe_mcp",
+        "call_mcp",
+    }
+    assert expected <= set(root_names)
+    assert expected <= set(child_names)
 
     # Five hypothetical connections would once have added ~all their tools as
     # namespaced provider tools; none of those names may appear now.
@@ -666,12 +809,14 @@ def test_agent_carries_exactly_the_dispatch_tools_regardless_of_connections() ->
 # --- prompt guidance replaces the old per-connection inventory ---------------
 
 
-def test_prompt_renders_static_three_tool_guidance_when_mcp_available() -> None:
+def test_prompt_renders_targeted_tool_guidance_when_mcp_available() -> None:
     prompt = render_system_prompt(system_prompt_context={"mcp_available": True})
 
     assert "MCP CONNECTIONS" in prompt
-    # The three discovery/dispatch tools are named as the way in.
+    # Targeted discovery, one-schema lookup, dispatch, and compatibility are named.
     assert "list_mcps" in prompt
+    assert "search_mcp_tools" in prompt
+    assert "get_mcp_tool_schema" in prompt
     assert "describe_mcp" in prompt
     assert "call_mcp" in prompt
 
