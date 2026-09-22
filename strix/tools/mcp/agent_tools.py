@@ -1,7 +1,7 @@
 """The generic MCP discovery and dispatch tools every agent carries.
 
 Under the generic-dispatch model an agent does not get one tool per MCP tool.
-It gets exactly these three and discovers connections on demand:
+It gets four primary tools and discovers connections on demand:
 
 - ``list_mcps()`` returns the connections available this run — each connection's
   id, name, description, and tool count, with no tool schemas — so the model can
@@ -15,7 +15,7 @@ It gets exactly these three and discovers connections on demand:
 agents use targeted search and one-schema lookup instead of receiving a whole
 provider catalog in one model turn.
 
-All three read the per-run :class:`~strix.tools.mcp.registry.McpRegistry` from the
+All four read the per-run :class:`~strix.tools.mcp.registry.McpRegistry` from the
 run context under :data:`~strix.tools.mcp.registry.MCP_REGISTRY_CONTEXT_KEY`. They
 are ordinary ``FunctionTool`` objects placed in the agent factory's base tool set,
 so the factory's output-bounding and disk-spill wrapping apply to their results
@@ -64,12 +64,11 @@ async def list_mcps(ctx: RunContextWrapper) -> dict[str, Any]:
     """List the MCP connections available this run, so you can discover them.
 
     Read-only. Returns one entry per connection with its ``id`` (the exact name
-    you pass to ``describe_mcp`` and ``call_mcp``), ``name``, ``description``, and
-    ``tool_count`` — no tool schemas. The three MCP tools work in order: call
-    ``list_mcps`` to discover the available connections, then ``describe_mcp`` on
-    one connection to inspect its tools and their input schemas, then ``call_mcp``
-    to run one of its tools. Returns an empty ``connections`` list when the run has
-    no MCP connections.
+    you pass to the other MCP tools), ``name``, ``description``, and
+    ``tool_count``. The response does not include tool schemas. Call
+    ``search_mcp_tools`` next. Then call ``get_mcp_tool_schema`` for one selected
+    tool before you call ``call_mcp``. Returns an empty ``connections`` list when
+    the run has no MCP connections.
     """
     registry = _registry_from_ctx(ctx)
     if registry is None or not registry:
@@ -92,13 +91,12 @@ async def list_mcps(ctx: RunContextWrapper) -> dict[str, Any]:
 
 @function_tool(timeout=60)
 async def describe_mcp(ctx: RunContextWrapper, connection: str) -> str:
-    """List the tools one MCP connection offers, with their input schemas.
+    """Return one connection's full tool catalog as a compatibility fallback.
 
-    Read-only. Look up a connection by the id ``list_mcps`` reported for it; this
-    returns each of its tools with the tool's name, description, and JSON input
-    schema — the argument shape you pass to ``call_mcp``. Call this before
-    ``call_mcp`` on any connection you have not used yet. Nothing is fetched from
-    or run against the connection's data.
+    Read-only. This result can be large because it includes every tool schema.
+    First use ``search_mcp_tools`` and ``get_mcp_tool_schema``. Use this fallback
+    only when targeted search cannot identify an expected tool. Nothing is read
+    from the connected account.
 
     Args:
         connection: The connection name exactly as reported by ``list_mcps``.
@@ -126,18 +124,23 @@ def _search_score(tool: MCPTool, query_terms: list[str], active: bool) -> tuple[
     if not query_terms:
         return (100 if active else 0, name)
     score = 100 if active else 0
+    matched_terms = 0
     for term in query_terms:
         if name == term:
             score += 60
+            matched_terms += 1
         elif name.startswith(term):
             score += 35
+            matched_terms += 1
         elif term in name:
             score += 25
+            matched_terms += 1
         elif term in description:
             score += 10
-        else:
-            return (-1, name)
-    return (score, name)
+            matched_terms += 1
+    if matched_terms == 0 and not active:
+        return (-1, name)
+    return (score + (matched_terms * 5), name)
 
 
 @function_tool(timeout=60)
@@ -235,19 +238,18 @@ async def call_mcp(
 ) -> Any:
     """Call one tool on one MCP connection and return its result.
 
-    Address the tool by the connection id from ``list_mcps`` and the tool name
-    from ``describe_mcp`` on that connection. Pass the tool's arguments as an
-    object matching the input schema ``describe_mcp`` showed for it (omit it, or
-    pass an empty object, for a tool that takes no arguments).
+    Use the connection id from ``list_mcps``. Use the tool name from
+    ``search_mcp_tools``. Pass an object that matches the schema from
+    ``get_mcp_tool_schema``. Omit the arguments for a tool that takes no
+    arguments.
 
     Args:
         connection: The connection name exactly as reported by ``list_mcps``.
-        tool: The tool name, exactly as reported by ``describe_mcp``.
+        tool: The tool name exactly as reported by ``search_mcp_tools``.
         arguments: The tool's arguments as a JSON object of names to values (for
             example ``{"path": "app.py"}``), or omitted/empty for a tool that
-            takes none. Pass an object, not a stringified one. Its shape is
-            whatever ``describe_mcp`` showed for the tool rather than a shape this
-            tool fixes in advance.
+            takes none. Pass an object, not a stringified object. Match the shape
+            that ``get_mcp_tool_schema`` returned.
     """
     registry = _registry_from_ctx(ctx)
     if registry is None or not registry:
@@ -257,7 +259,7 @@ async def call_mcp(
         return _unknown_connection(connection, registry)
     invalid_arguments = (
         f"Invalid arguments for {connection!r}.{tool}: expected a JSON object of "
-        "argument names to values, or none. Call describe_mcp for the input schema."
+        "argument names to values, or none. Call get_mcp_tool_schema for the schema."
     )
     if isinstance(arguments, str):
         # The ``arguments`` parameter is schema-less (an open object is not
@@ -277,10 +279,8 @@ async def call_mcp(
         return _errored_tool_output(str(exc))
     valid_names = {mcp_tool.name for mcp_tool in available}
     if tool not in valid_names:
-        offered = ", ".join(sorted(valid_names)) or "(none)"
         return (
             f"Unknown tool {tool!r} on MCP connection {connection!r}. "
-            f"Tools this connection offers: {offered}. "
             "Call search_mcp_tools, then get_mcp_tool_schema."
         )
     session = await entry.ensure_connected()

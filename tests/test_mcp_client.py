@@ -526,20 +526,104 @@ async def test_search_then_get_one_schema_without_returning_other_schemas() -> N
         _ctx(registry),
         json.dumps({"connection": "docs", "query": "page content"}),
     )
-    assert searched["matches"] == [
-        {
-            "name": "fetch_page",
-            "description": "Fetch page content",
-            "active": True,
-        }
+    assert [match["name"] for match in searched["matches"]] == [
+        "fetch_page",
+        "find_pages",
     ]
-    assert "input_schema" not in searched["matches"][0]
+    assert all("input_schema" not in match for match in searched["matches"])
 
     schema = await get_mcp_tool_schema.on_invoke_tool(
         _ctx(registry),
         json.dumps({"connection": "docs", "tool": "fetch_page"}),
     )
     assert schema["input_schema"]["properties"] == {"page_id": {"type": "string"}}
+
+
+@pytest.mark.asyncio
+async def test_search_matches_any_query_term_and_prioritizes_active_tools() -> None:
+    registry = McpRegistry()
+    registry.add(
+        name="docs",
+        server=FakeMCPServer(
+            "docs",
+            [
+                MCPTool(
+                    name="fetch_page",
+                    description="Fetch page content",
+                    inputSchema={"type": "object"},
+                ),
+                MCPTool(
+                    name="search_documents",
+                    description="Search documents",
+                    inputSchema={"type": "object"},
+                ),
+                MCPTool(
+                    name="list_records",
+                    description="List records",
+                    inputSchema={"type": "object"},
+                ),
+            ],
+        ),
+        config=McpConnectionConfig(
+            name="docs",
+            url="https://example.invalid/mcp",
+            active_tools=["fetch_page"],
+        ),
+    )
+
+    searched = await search_mcp_tools.on_invoke_tool(
+        _ctx(registry),
+        json.dumps(
+            {
+                "connection": "docs",
+                "query": "read list search document",
+            }
+        ),
+    )
+
+    assert [match["name"] for match in searched["matches"]] == [
+        "fetch_page",
+        "search_documents",
+        "list_records",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_search_returns_active_tools_when_text_does_not_match() -> None:
+    registry = McpRegistry()
+    registry.add(
+        name="docs",
+        server=FakeMCPServer(
+            "docs",
+            [
+                _mcp_tool("fetch_page"),
+                _mcp_tool("search_documents"),
+            ],
+        ),
+        config=McpConnectionConfig(
+            name="docs",
+            url="https://example.invalid/mcp",
+            active_tools=["fetch_page"],
+        ),
+    )
+
+    searched = await search_mcp_tools.on_invoke_tool(
+        _ctx(registry),
+        json.dumps(
+            {
+                "connection": "docs",
+                "query": "unrelated capability",
+            }
+        ),
+    )
+
+    assert searched["matches"] == [
+        {
+            "name": "fetch_page",
+            "description": "remote tool fetch_page",
+            "active": True,
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -741,7 +825,8 @@ async def test_call_mcp_errors_on_unknown_tool() -> None:
     )
 
     assert "Unknown tool 'delete_everything'" in out
-    assert "read_file" in out
+    assert "search_mcp_tools" in out
+    assert "read_file" not in out
     # A rejected tool name never reaches the server.
     assert server.calls == []
 
@@ -799,7 +884,7 @@ async def test_call_mcp_flags_an_errored_result_failed_for_the_tui() -> None:
     assert out == {"type": "text", "text": "boom:read_file", "success": False}
 
 
-# --- the two tools are the only MCP surface every agent gets -----------------
+# --- generic MCP tools are the only MCP surface every agent gets -------------
 
 
 def test_agent_carries_exactly_the_generic_mcp_tools_regardless_of_connections() -> None:
@@ -852,6 +937,13 @@ def test_prompt_renders_targeted_tool_guidance_when_mcp_available() -> None:
     assert "call_mcp" in prompt
 
 
+def test_model_facing_mcp_guidance_uses_targeted_discovery() -> None:
+    assert "describe_mcp" not in list_mcps.description
+    assert "describe_mcp" not in call_mcp.description
+    assert "full tool catalog" in describe_mcp.description
+    assert "compatibility fallback" in describe_mcp.description
+
+
 def test_prompt_has_no_mcp_section_without_availability() -> None:
     assert "MCP CONNECTIONS" not in render_system_prompt(system_prompt_context={})
 
@@ -859,7 +951,7 @@ def test_prompt_has_no_mcp_section_without_availability() -> None:
 def test_prompt_renders_named_connection_inventory() -> None:
     """With mcp_available set, the prompt names each connected server (name, tool
     count, purpose) so every agent sees what is available at the start, alongside
-    the three dispatch tools for re-listing and inspecting them at run time."""
+    the discovery and dispatch tools for re-listing and inspecting them at run time."""
     prompt = render_system_prompt(
         system_prompt_context={
             "mcp_available": True,

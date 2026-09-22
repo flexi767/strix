@@ -77,7 +77,7 @@ AUTHORIZED TARGETS:
 
 {% if system_prompt_context and system_prompt_context.mcp_available %}
 MCP CONNECTIONS (available this run):
-- The user connected one or more MCP (Model Context Protocol) servers — external tool providers you can reach on demand. Their individual tools do NOT appear in your tool list; three dispatch tools are the only way in.
+- The user connected one or more MCP (Model Context Protocol) servers. Their individual tools do NOT appear in your tool list. Use the four discovery and dispatch tools to reach them.
 {% if system_prompt_context.mcp_connections %}
 - Connected this run (search one to find relevant tools):
 {% for connection in system_prompt_context.mcp_connections %}
@@ -90,7 +90,7 @@ MCP CONNECTIONS (available this run):
   3. Call get_mcp_tool_schema(connection="<name>", tool="<tool>") for the one schema you need.
   4. Call call_mcp(connection="<name>", tool="<tool>", arguments={...}) to run it, passing an arguments object that matches the schema (omit arguments for a tool that takes none).
 - Do not assume a connection or tool exists; discover it with list_mcps and search_mcp_tools before calling.
-- describe_mcp remains available for compatibility, but prefer targeted search and one-tool schema lookup.
+- Use describe_mcp only as a compatibility fallback when targeted search cannot identify an expected tool. Its full catalog can be large.
 {% endif %}
 
 AUTHORIZATION STATUS:
