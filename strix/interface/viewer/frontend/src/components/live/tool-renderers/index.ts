@@ -12,6 +12,7 @@ import FileEditRenderer from "./FileEditRenderer";
 import ApplyPatchRenderer from "./ApplyPatchRenderer";
 import ViewImageRenderer from "./ViewImageRenderer";
 import VulnReportRenderer from "./VulnReportRenderer";
+import VulnReportDeleteRenderer from "./VulnReportDeleteRenderer";
 import ReportListRenderer from "./ReportListRenderer";
 import ProxyRenderer from "./ProxyRenderer";
 import ThinkRenderer from "./ThinkRenderer";
@@ -151,6 +152,7 @@ const RENDERER_OVERRIDES: Partial<Record<string, ComponentType<ToolRendererProps
   view_image: ViewImageRenderer,
   list_reports: ReportListRenderer,
   get_report: ReportListRenderer,
+  delete_vulnerability_report: VulnReportDeleteRenderer,
 };
 
 /**

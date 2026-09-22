@@ -720,7 +720,7 @@ def _do_delete(
             ),
         }
 
-    from strix.report.state import get_global_report_state
+    from strix.report.state import ReportOwnershipError, get_global_report_state
 
     report_state = get_global_report_state()
     if report_state is None:
@@ -736,6 +736,15 @@ def _do_delete(
             deleted_by_agent_id=agent_id,
             deleted_by_agent_name=agent_name,
         )
+    except ReportOwnershipError as e:
+        return {
+            "success": False,
+            "error": (
+                f"{e!s}. If you have disproved another agent's finding, send that agent "
+                "your counterevidence so it can withdraw the report itself."
+            ),
+            "report_id": report_id,
+        }
     except Exception as e:
         logger.exception("delete_vulnerability_report persistence failed")
         return {
@@ -1645,7 +1654,8 @@ async def delete_vulnerability_report(
     impact and the counterevidence come down together. Do NOT rewrite a
     report into a "retracted" or "false positive" note either: delete it.
 
-    Only withdraw a report you can name and have re-tested yourself. Call
+    You can only withdraw a report you filed; a report filed by another
+    agent is refused, so send that agent your counterevidence instead. Call
     ``get_report`` first to read what it claims, then state in
     ``delete_reason`` exactly what disproved it, so the scan history shows
     why the finding is gone. A withdrawn report cannot be restored; if new

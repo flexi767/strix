@@ -13,7 +13,7 @@ from strix.report.dedupe import (
     _prepare_report_for_comparison,
     check_duplicate,
 )
-from strix.report.state import ReportState, set_global_report_state
+from strix.report.state import ReportOwnershipError, ReportState, set_global_report_state
 from strix.tools.finish.tool import finish_scan
 from strix.tools.reporting import tool as reporting_tool
 from strix.tools.reporting.tool import (
@@ -2003,8 +2003,8 @@ def test_delete_withdraws_a_disproved_report_and_its_artifacts(
     result = _do_delete(
         report_id="vuln-0009",
         delete_reason="The cross-tenant read came from the harness reusing the victim's session.",
-        agent_id="834f79fb",
-        agent_name="Validation Agent",
+        agent_id="aaaa1111",
+        agent_name="Recon Agent",
     )
 
     assert result["success"] is True
@@ -2020,8 +2020,8 @@ def test_delete_withdraws_a_disproved_report_and_its_artifacts(
     assert persisted[0]["id"] == "vuln-0009"
     assert persisted[0]["agent_id"] == "aaaa1111", "the callback sees the finding as filed"
     deletion = persisted[0]["deletion"]
-    assert deletion["agent_id"] == "834f79fb"
-    assert deletion["agent_name"] == "Validation Agent"
+    assert deletion["agent_id"] == "aaaa1111"
+    assert deletion["agent_name"] == "Recon Agent"
     assert deletion["filed_by_agent_id"] == "aaaa1111"
     assert deletion["reason"].startswith("The cross-tenant read")
 
@@ -2035,7 +2035,9 @@ def test_delete_withdraws_a_disproved_report_and_its_artifacts(
 def test_delete_never_reissues_the_withdrawn_id(report_state: ReportState) -> None:
     """The next finding must not inherit a deleted report's id, file or history."""
     _seed_saved_report(report_state)
-    assert report_state.delete_vulnerability_report("vuln-0009", delete_reason="Disproved.")
+    assert report_state.delete_vulnerability_report(
+        "vuln-0009", delete_reason="Disproved.", deleted_by_agent_id="aaaa1111"
+    )
 
     new_id = report_state.add_vulnerability_report(title="A real finding", severity="high")
 
@@ -2043,26 +2045,151 @@ def test_delete_never_reissues_the_withdrawn_id(report_state: ReportState) -> No
     assert [r["id"] for r in report_state.vulnerability_reports] == ["vuln-0010"]
 
 
+def _assert_report_still_filed(
+    report_state: ReportState, run_dir: Path, original: dict[str, Any]
+) -> None:
+    """The report is in memory and in every artifact exactly as it was filed."""
+    assert report_state.vulnerability_reports == [original]
+    assert "vuln-0009" in report_state._saved_vuln_ids
+    assert (run_dir / "vulnerabilities" / "vuln-0009.md").exists()
+    indexed = json.loads((run_dir / "vulnerabilities.json").read_text(encoding="utf-8"))
+    assert [r["id"] for r in indexed] == ["vuln-0009"]
+    assert "vuln-0009" in (run_dir / "vulnerabilities.csv").read_text(encoding="utf-8")
+    run = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+    assert "deleted_vulnerability_reports" not in run
+    assert "deleted_vulnerability_reports" not in report_state.run_record
+    assert report_state._next_report_id() == "vuln-0010"
+
+
+@pytest.mark.parametrize(
+    ("agent_id", "agent_name"),
+    [("834f79fb", "Validation Agent"), (None, None)],
+    ids=["another agent", "no caller identity"],
+)
+def test_delete_refuses_a_report_the_caller_did_not_file(
+    report_state: ReportState, agent_id: str | None, agent_name: str | None
+) -> None:
+    """Report ids are sequential and listed to every agent; knowing one is not owning it."""
+    run_dir = _seed_saved_report(report_state)
+    original = dict(report_state.vulnerability_reports[0])
+    calls: list[dict[str, Any]] = []
+    report_state.vulnerability_deleted_callback = calls.append
+
+    result = _do_delete(
+        report_id="vuln-0009",
+        delete_reason="Disproved.",
+        agent_id=agent_id,
+        agent_name=agent_name,
+    )
+
+    assert result["success"] is False
+    assert "filed by agent aaaa1111" in result["error"]
+    assert "send that agent your counterevidence" in result["error"]
+    assert calls == [], "a refused deletion never reaches persistence"
+    _assert_report_still_filed(report_state, run_dir, original)
+
+
+def test_delete_refuses_a_foreign_report_at_the_state_layer(report_state: ReportState) -> None:
+    _seed_saved_report(report_state)
+
+    with pytest.raises(ReportOwnershipError) as excinfo:
+        report_state.delete_vulnerability_report(
+            "vuln-0009", delete_reason="Disproved.", deleted_by_agent_id="834f79fb"
+        )
+
+    assert excinfo.value.filed_by == "aaaa1111"
+    assert excinfo.value.caller == "834f79fb"
+    assert len(report_state.vulnerability_reports) == 1
+
+
+def test_delete_allows_a_report_filed_without_an_agent(report_state: ReportState) -> None:
+    """A report with no filer on record (host-side or legacy) has no owner to check."""
+    _seed_saved_report(report_state)
+    del report_state.vulnerability_reports[0]["agent_id"]
+
+    deleted = report_state.delete_vulnerability_report(
+        "vuln-0009", delete_reason="Disproved.", deleted_by_agent_id="834f79fb"
+    )
+
+    assert deleted is not None
+    assert report_state.vulnerability_reports == []
+    history = report_state.run_record["deleted_vulnerability_reports"]
+    assert history[0]["agent_id"] == "834f79fb"
+    assert "filed_by_agent_id" not in history[0]
+
+
 def test_delete_reports_persistence_failure_and_keeps_the_report(
     report_state: ReportState,
 ) -> None:
+    """Persistence refused after the local indexes were rewritten: they are rewritten back."""
     run_dir = _seed_saved_report(report_state)
     original = dict(report_state.vulnerability_reports[0])
 
     def fail_persistence(_report: dict[str, Any]) -> None:
+        assert report_state.vulnerability_reports == [], "indexes are rewritten first"
         raise RuntimeError("persistence failed")
 
     report_state.vulnerability_deleted_callback = fail_persistence
 
-    result = _do_delete(report_id="vuln-0009", delete_reason="Disproved.")
+    result = _do_delete(report_id="vuln-0009", delete_reason="Disproved.", agent_id="aaaa1111")
 
     assert result["success"] is False
     assert "persistence failed" in result["error"]
     assert "still on file" in result["error"]
-    assert report_state.vulnerability_reports == [original]
-    assert (run_dir / "vulnerabilities" / "vuln-0009.md").exists()
-    assert "deleted_vulnerability_reports" not in report_state.run_record
-    assert report_state._next_report_id() == "vuln-0010"
+    _assert_report_still_filed(report_state, run_dir, original)
+
+
+def test_delete_reports_an_artifact_write_failure_and_keeps_the_report(
+    report_state: ReportState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A disk that cannot take the rewritten run record is a failed deletion, not a
+    success with stale artifacts; persistence is never told about it."""
+    run_dir = _seed_saved_report(report_state)
+    original = dict(report_state.vulnerability_reports[0])
+    calls: list[dict[str, Any]] = []
+    report_state.vulnerability_deleted_callback = calls.append
+    attempts = 0
+
+    def write_run_record_once_failing(run_dir_: Path, record: dict[str, Any]) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError(28, "No space left on device")
+        (run_dir_ / "run.json").write_text(json.dumps(record), encoding="utf-8")
+
+    monkeypatch.setattr("strix.report.state.write_run_record", write_run_record_once_failing)
+
+    result = _do_delete(report_id="vuln-0009", delete_reason="Disproved.", agent_id="aaaa1111")
+
+    assert result["success"] is False
+    assert "No space left on device" in result["error"]
+    assert "still on file" in result["error"]
+    assert calls == []
+    assert attempts == 2, "the run record is written back after the failed rewrite"
+    _assert_report_still_filed(report_state, run_dir, original)
+
+
+def test_delete_can_be_retried_after_persistence_recovers(report_state: ReportState) -> None:
+    run_dir = _seed_saved_report(report_state)
+    outcomes = iter([RuntimeError("persistence failed"), None])
+
+    def flaky_persistence(_report: dict[str, Any]) -> None:
+        outcome = next(outcomes)
+        if outcome is not None:
+            raise outcome
+
+    report_state.vulnerability_deleted_callback = flaky_persistence
+
+    first = _do_delete(report_id="vuln-0009", delete_reason="Disproved.", agent_id="aaaa1111")
+    second = _do_delete(report_id="vuln-0009", delete_reason="Disproved.", agent_id="aaaa1111")
+
+    assert first["success"] is False
+    assert second["success"] is True
+    assert report_state.vulnerability_reports == []
+    assert not (run_dir / "vulnerabilities" / "vuln-0009.md").exists()
+    assert json.loads((run_dir / "vulnerabilities.json").read_text(encoding="utf-8")) == []
+    run = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+    assert [e["id"] for e in run["deleted_vulnerability_reports"]] == ["vuln-0009"]
 
 
 @pytest.mark.parametrize(
@@ -2083,7 +2210,7 @@ def test_delete_rejects_a_call_it_cannot_act_on(
     calls: list[dict[str, Any]] = []
     report_state.vulnerability_deleted_callback = calls.append
 
-    result = _do_delete(report_id=report_id, delete_reason=delete_reason)
+    result = _do_delete(report_id=report_id, delete_reason=delete_reason, agent_id="aaaa1111")
 
     assert result["success"] is False
     assert expected in result["error"]
@@ -2093,9 +2220,9 @@ def test_delete_rejects_a_call_it_cannot_act_on(
 
 async def test_delete_tool_carries_the_caller_identity(report_state: ReportState) -> None:
     _seed_saved_report(report_state)
-    coordinator = type("Coordinator", (), {"names": {"834f79fb": "Validation Agent"}})()
+    coordinator = type("Coordinator", (), {"names": {"aaaa1111": "Recon Agent"}})()
     ctx = ToolContext(
-        context={"agent_id": "834f79fb", "coordinator": coordinator},
+        context={"agent_id": "aaaa1111", "coordinator": coordinator},
         tool_name="delete_vulnerability_report",
         tool_call_id="call-1",
         tool_arguments="{}",
@@ -2109,6 +2236,6 @@ async def test_delete_tool_carries_the_caller_identity(report_state: ReportState
 
     assert result["success"] is True
     history = report_state.run_record["deleted_vulnerability_reports"]
-    assert history[0]["agent_id"] == "834f79fb"
-    assert history[0]["agent_name"] == "Validation Agent"
+    assert history[0]["agent_id"] == "aaaa1111"
+    assert history[0]["agent_name"] == "Recon Agent"
     assert "update_vulnerability_report" in delete_vulnerability_report.description
