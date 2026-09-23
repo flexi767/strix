@@ -257,7 +257,7 @@ def request_id_from_text(text: str | None) -> str | None:
 
 
 # --------------------------------------------------------------------------- #
-# Free-form telemetry: response headers, details, raw bodies                   #
+# Free-form telemetry: response headers and details                            #
 # --------------------------------------------------------------------------- #
 
 FINISH_REASON_MAX_CHARS = 128
@@ -281,7 +281,7 @@ HEADER_VALUE_MAX_CHARS = 512
 
 # Keys of a request/response structure whose value is content: the prompt, the
 # completion, tool schemas and arguments. ``details`` is metadata about the
-# exchange, never the exchange itself; the bodies are a separate opt-in.
+# exchange, never the exchange itself; bodies are measured, never kept.
 _CONTENT_KEYS: frozenset[str] = frozenset(
     {
         "messages",
