@@ -39,6 +39,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 from urllib.parse import urlsplit
 
 from agents.items import ModelResponse
+from agents.models.fake_id import FAKE_RESPONSES_ID
 from agents.models.interface import Model
 from agents.tool import FunctionTool
 from agents.usage import Usage
@@ -258,23 +259,27 @@ def clean_error_message(exc: BaseException) -> str:
 
 # Provider-side request identifiers, in the order they are trusted. Anthropic
 # and most gateways: ``request-id``; OpenAI/Azure: ``x-request-id``; Bedrock:
-# ``x-amzn-requestid``; Vertex/Gemini: ``x-goog-request-id``. LiteLLM prefixes
-# stored provider headers with ``llm_provider-``; both spellings are accepted.
+# ``x-amzn-requestid``; Vertex/Gemini: ``x-goog-request-id``; OpenRouter:
+# ``x-generation-id``. LiteLLM prefixes stored provider headers with
+# ``llm_provider-``; both spellings are accepted.
 _REQUEST_ID_HEADERS: tuple[str, ...] = (
     "request-id",
     "x-request-id",
     "x-amzn-requestid",
     "x-amz-request-id",
     "x-goog-request-id",
-    "cf-ray",
+    "x-generation-id",
 )
+# The Cloudflare edge id: the only handle a reply carries when the provider
+# sends none of its own, in the header or the body.
+_EDGE_ID_HEADERS: tuple[str, ...] = ("cf-ray",)
 _LITELLM_HEADER_PREFIX = "llm_provider-"
 
 # Anthropic error bodies carry the id even when a gateway strips the header.
-_BODY_REQUEST_ID = re.compile(r"[\"']?request_id[\"']?\s*[:=]\s*[\"']?(req_[A-Za-z0-9_-]{6,})")
+_BODY_REQUEST_ID = re.compile(r"[\"']?request_id[\"']?\s*[:=]\s*[\"']?(req_[A-Za-z0-9_-]+)")
 
 
-def request_id_from_headers(headers: Mapping[str, Any] | None) -> str | None:
+def _header_value(headers: Mapping[str, Any] | None, names: tuple[str, ...]) -> str | None:
     if not headers:
         return None
     normalized: dict[str, str] = {}
@@ -283,10 +288,20 @@ def request_id_from_headers(headers: Mapping[str, Any] | None) -> str | None:
             continue
         name = str(key).lower().removeprefix(_LITELLM_HEADER_PREFIX)
         normalized.setdefault(name, value.strip())
-    for name in _REQUEST_ID_HEADERS:
+    for name in names:
         if name in normalized:
             return normalized[name]
     return None
+
+
+def request_id_from_headers(headers: Mapping[str, Any] | None) -> str | None:
+    """The provider's own request id from a reply's headers, if it sent one."""
+    return _header_value(headers, _REQUEST_ID_HEADERS)
+
+
+def edge_request_id(headers: Mapping[str, Any] | None) -> str | None:
+    """The edge network's id, for replies where nothing better exists."""
+    return _header_value(headers, _EDGE_ID_HEADERS)
 
 
 def request_id_from_text(text: str | None) -> str | None:
@@ -294,6 +309,13 @@ def request_id_from_text(text: str | None) -> str | None:
         return None
     match = _BODY_REQUEST_ID.search(text)
     return match.group(1) if match else None
+
+
+def request_id_from_reply(headers: Mapping[str, Any] | None, text: str | None = None) -> str | None:
+    """Provider header id, then the id in the error body, then the edge id."""
+    return (
+        request_id_from_headers(headers) or request_id_from_text(text) or edge_request_id(headers)
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -537,6 +559,13 @@ def _str_or_none(value: object) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+def _real_response_id(response: ModelResponse | None) -> str | None:
+    """The provider's response id; the SDK's chat-completions placeholder is not one."""
+    if response is None or response.response_id == FAKE_RESPONSES_ID:
+        return None
+    return _str_or_none(response.response_id)
+
+
 def _mapping(value: object) -> Mapping[str, Any] | None:
     return cast("Mapping[str, Any]", value) if isinstance(value, Mapping) else None
 
@@ -594,8 +623,10 @@ def _litellm_request_body(kwargs: Mapping[str, Any]) -> object:
     params, which is the same information before translation.
     """
     additional = _mapping(kwargs.get("additional_args"))
-    payload = _mapping(additional.get("complete_input_dict")) if additional else None
-    if payload:
+    payload = additional.get("complete_input_dict") if additional else None
+    if isinstance(payload, str | bytes) and payload:
+        return payload
+    if _mapping(payload):
         return payload
     body: dict[str, Any] = {"model": kwargs.get("model")}
     messages = kwargs.get("messages")
@@ -627,9 +658,9 @@ def _exception_details(exc: BaseException | None) -> dict[str, Any] | None:
     if exc is None:
         return None
     error: dict[str, Any] = {}
-    body = getattr(exc, "body", None)
-    if isinstance(body, Mapping | str):
-        error["body"] = body if isinstance(body, Mapping) else _mapping(_parse_json(body)) or body
+    body = _error_body(exc)
+    if body is not None:
+        error["body"] = body
     for name in ("code", "param", "type", "llm_provider", "max_retries", "num_retries"):
         value = getattr(exc, name, None)
         if isinstance(value, str | int) and not isinstance(value, bool):
@@ -637,9 +668,26 @@ def _exception_details(exc: BaseException | None) -> dict[str, Any] | None:
     return error or None
 
 
-def _parse_json(text: str) -> object:
+def _error_body(exc: BaseException) -> object:
+    """The provider's error reply as the SDK kept it.
+
+    The OpenAI SDK parses it onto ``body``. LiteLLM's mapped exceptions keep
+    only their message, which ends in the reply text (``AnthropicException -
+    {...}``); the JSON object in that text is the body.
+    """
+    body = getattr(exc, "body", None)
+    if body is not None:
+        return body
+    text = getattr(exc, "message", None)
+    return _json_object_in(text if isinstance(text, str) else str(exc))
+
+
+def _json_object_in(text: str) -> Mapping[str, Any] | None:
+    start, end = text.find("{"), text.rfind("}")
+    if start < 0 or end <= start:
+        return None
     try:
-        return json.loads(text)
+        return _mapping(json.loads(text[start : end + 1]))
     except ValueError:
         return None
 
@@ -670,17 +718,32 @@ def _exception_headers(exc: BaseException | None) -> Mapping[str, Any] | None:
     return first
 
 
-def _exception_body(exc: BaseException) -> object:
-    """The response body an SDK exception carries, else its message text."""
-    body = getattr(exc, "body", None)
-    if body is not None:
-        return body
-    text = getattr(exc, "message", None)
-    return text if isinstance(text, str) and text else str(exc)
+def _exception_body_size(exc: BaseException, status_code: int | None) -> int | None:
+    """Size of the error reply's body: the bytes the OpenAI SDK read, else the
+    body LiteLLM kept. Unknown when no reply arrived or the SDK kept none of it.
+    """
+    if status_code is None:
+        return None
+    if isinstance(exc, APIStatusError):
+        # LiteLLM's mapped exceptions subclass this with an empty stand-in response.
+        with contextlib.suppress(Exception):
+            content = exc.response.content
+            if content:
+                return len(content)
+    return json_size(_error_body(exc))
 
 
-def _exception_body_size(exc: BaseException) -> int | None:
-    return json_size(_exception_body(exc))
+def _litellm_reply_status(exc: BaseException, headers: Mapping[str, Any] | None) -> int | None:
+    """The status of the provider's reply, or None when no reply arrived.
+
+    LiteLLM stamps a status on every exception, including 408 on timeouts and
+    500 on connection failures that never reached the provider. Those are the
+    non-status ``APIError`` family and carry no response headers; a reply that
+    was received always does.
+    """
+    if isinstance(exc, APIError) and not isinstance(exc, APIStatusError) and not headers:
+        return None
+    return _int_or_none(getattr(exc, "status_code", None))
 
 
 def _headers_mapping(headers: object) -> Mapping[str, Any] | None:
@@ -713,10 +776,13 @@ def event_from_litellm(
         or _str_or_none(litellm_params.get("custom_llm_provider"))
     )
     model = _str_or_none(kwargs.get("model")) or _str_or_none(slo.get("model")) or "unknown"
+    # The endpoint the call was configured with. LiteLLM's hidden ``api_base``
+    # can be the provider default (``api.openai.com``) on a non-streamed call
+    # that actually went to a gateway.
     host = api_host(
-        _str_or_none(hidden.get("api_base"))
+        _str_or_none(litellm_params.get("api_base"))
         or _str_or_none(slo.get("api_base"))
-        or _str_or_none(litellm_params.get("api_base"))
+        or _str_or_none(hidden.get("api_base"))
     )
     streaming = bool(kwargs.get("stream")) or bool(slo.get("stream"))
     call_id = (
@@ -725,13 +791,12 @@ def event_from_litellm(
         or str(uuid.uuid4())
     )
 
-    response_headers = _mapping(hidden.get("additional_headers"))
+    # LiteLLM stores the reply's headers on the logging object or on the
+    # response, depending on the adapter; the first non-empty block is the reply.
     response_hidden = _mapping(getattr(response, "_hidden_params", None)) or {}
-    hidden_headers = _mapping(response_hidden.get("additional_headers"))
-    request_id = request_id_from_headers(response_headers) or request_id_from_headers(
-        hidden_headers
+    reply_headers = _mapping(hidden.get("additional_headers")) or _mapping(
+        response_hidden.get("additional_headers")
     )
-    headers = headers_from_response(response_headers) or headers_from_response(hidden_headers)
 
     ttft_ms: int | None = None
     if streaming:
@@ -750,7 +815,7 @@ def event_from_litellm(
         streaming=streaming,
         outcome=outcome,
         status_code=None,
-        provider_request_id=request_id,
+        provider_request_id=request_id_from_reply(reply_headers),
         response_id=None,
         error_type=None,
         error_message=None,
@@ -762,11 +827,11 @@ def event_from_litellm(
         retry_attempt=context.retry_attempt,
         request_bytes=json_size(_litellm_request_body(kwargs)),
         time_to_first_token_ms=ttft_ms,
-        response_headers=headers,
+        response_headers=headers_from_response(reply_headers),
     )
     if outcome == "success":
         return _litellm_success(base, kwargs, response, hidden, slo)
-    return _litellm_failure(base, kwargs, exc, error_info, slo)
+    return _litellm_failure(base, kwargs, exc, error_info, slo, reply_headers)
 
 
 def _litellm_response_details(response: object) -> dict[str, Any] | None:
@@ -841,22 +906,21 @@ def _litellm_failure(
     exc: BaseException | None,
     error_info: Mapping[str, Any],
     slo: Mapping[str, Any],
+    reply_headers: Mapping[str, Any] | None,
 ) -> LlmRequestEvent:
     status_code: int | None = None
     error_type: str | None = None
     error_message: str | None = None
-    request_id = base.provider_request_id
-    headers = base.response_headers
     response_bytes: int | None = None
+    error: dict[str, Any] = {}
     if exc is not None:
-        status_code = _int_or_none(getattr(exc, "status_code", None))
+        reply_headers = reply_headers or _exception_headers(exc)
+        status_code = _litellm_reply_status(exc, reply_headers)
         error_type = type(exc).__name__
         error_message = clean_error_message(exc)
-        exc_headers = _exception_headers(exc)
-        request_id = request_id or request_id_from_headers(exc_headers)
-        headers = headers or headers_from_response(exc_headers)
-        response_bytes = _exception_body_size(exc)
-    if status_code is None:
+        response_bytes = _exception_body_size(exc, status_code)
+        error = _exception_details(exc) or {}
+    else:
         code = error_info.get("error_code")
         status_code = _int_or_none(code)
         if status_code is None and isinstance(code, str) and code.isdigit():
@@ -865,19 +929,21 @@ def _litellm_failure(
     if error_message is None:
         raw = _str_or_none(error_info.get("error_message")) or _str_or_none(slo.get("error_str"))
         error_message = redact(raw)[:ERROR_MESSAGE_MAX_CHARS] if raw else error_type
-    request_id = request_id or request_id_from_text(error_message)
+    provider = _str_or_none(error_info.get("llm_provider"))
+    if provider:
+        error.setdefault("llm_provider", provider)
     hidden = _mapping(slo.get("hidden_params")) or {}
     return replace(
         base,
         status_code=status_code,
-        provider_request_id=request_id,
+        provider_request_id=request_id_from_reply(reply_headers, error_message),
         error_type=error_type,
         error_message=error_message,
         response_bytes=response_bytes,
-        response_headers=headers,
+        response_headers=headers_from_response(reply_headers),
         details=merge_details(
             ("request", _litellm_request_details(kwargs)),
-            ("error", _exception_details(exc) or dict(error_info) or None),
+            ("error", error or None),
             ("litellm", _litellm_hidden_details(hidden, slo)),
         ),
     )
@@ -995,11 +1061,7 @@ def _openai_error_fields(exc: BaseException) -> tuple[int | None, str | None]:
     if isinstance(exc, APIStatusError):
         status = _int_or_none(exc.status_code)
         request_id = _str_or_none(exc.request_id)
-        if request_id is None:
-            request_id = request_id_from_headers(_openai_error_headers(exc))
-    if request_id is None:
-        request_id = request_id_from_text(str(exc))
-    return status, request_id
+    return status, request_id or request_id_from_reply(_openai_error_headers(exc), str(exc))
 
 
 def _openai_error_headers(exc: BaseException) -> Mapping[str, Any] | None:
@@ -1098,7 +1160,7 @@ class RequestLoggingModel(Model):
             streaming=streaming,
             outcome="success",
             status_code=reply.status_code or 200,
-            provider_request_id=request_id_from_headers(reply.headers),
+            provider_request_id=request_id_from_reply(reply.headers),
             response_id=None,
             error_type=None,
             error_message=None,
@@ -1115,7 +1177,7 @@ class RequestLoggingModel(Model):
         )
         if exc is None:
             usage = _openai_usage(response) if response is not None else {}
-            response_id = response.response_id if response is not None else None
+            response_id = _real_response_id(response)
             body_source = (
                 raw_response
                 if raw_response is not None
@@ -1136,16 +1198,17 @@ class RequestLoggingModel(Model):
             )
         status, request_id = _openai_error_fields(exc)
         error_headers = _openai_error_headers(exc)
+        # A reply the hook saw but the SDK turned into an exception (a
+        # cancel mid-stream, an unparsable 200) keeps its wire status.
+        status = status if status is not None else reply.status_code
         return replace(
             base,
             outcome="error",
-            # A reply the hook saw but the SDK turned into an exception (a
-            # cancel mid-stream, an unparsable 200) keeps its wire status.
-            status_code=status if status is not None else reply.status_code,
+            status_code=status,
             provider_request_id=request_id or base.provider_request_id,
             error_type=type(exc).__name__,
             error_message=_abandonment_message(exc) or clean_error_message(exc),
-            response_bytes=_exception_body_size(exc),
+            response_bytes=_exception_body_size(exc, status),
             response_headers=headers_from_response(error_headers) or base.response_headers,
             details=merge_details(
                 ("request", request.details),
@@ -1407,9 +1470,12 @@ def _openai_response_details(
 ) -> dict[str, Any] | None:
     """The Responses API object minus its output, or the SDK usage when that is all there is."""
     if isinstance(raw_response, BaseModel):
-        return raw_response.model_dump(
+        dumped = raw_response.model_dump(
             exclude={"output", "instructions", "tools", "text"}, exclude_none=True
         )
+        if dumped.get("id") == FAKE_RESPONSES_ID:
+            del dumped["id"]
+        return dumped
     if response is None:
         return None
     return {"usage": response.usage, "output_items": len(response.output)}
@@ -1436,7 +1502,7 @@ def failure_text(exc: BaseException) -> str:
     request_id: str | None = None
     if isinstance(exc, APIError):
         _, request_id = _openai_error_fields(exc)
-    request_id = request_id or request_id_from_headers(_exception_headers(exc))
+    request_id = request_id or request_id_from_reply(_exception_headers(exc), text)
     if request_id and request_id not in text:
         text = f"{text} [provider request id: {request_id}]"
     return text
@@ -1452,6 +1518,7 @@ __all__ = [
     "bind_call_context",
     "clean_error_message",
     "current_call_context",
+    "edge_request_id",
     "emit",
     "event_from_litellm",
     "failure_text",
@@ -1463,6 +1530,7 @@ __all__ = [
     "redact",
     "register_sink",
     "request_id_from_headers",
+    "request_id_from_reply",
     "request_id_from_text",
     "reset_call_context",
     "sanitize_details",

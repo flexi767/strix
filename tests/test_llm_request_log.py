@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -12,10 +13,15 @@ import litellm
 import pytest
 from agents.items import ModelResponse
 from agents.models import _openai_shared
+from agents.models.fake_id import FAKE_RESPONSES_ID
 from agents.models.interface import Model
 from agents.models.openai_provider import shared_http_client
 from agents.tool import FunctionTool
 from agents.usage import Usage
+from litellm.exceptions import APIConnectionError as LiteLlmConnectionError
+from litellm.exceptions import APIError as LiteLlmApiError
+from litellm.exceptions import AuthenticationError as LiteLlmAuthenticationError
+from litellm.exceptions import Timeout as LiteLlmTimeout
 from litellm.llms.anthropic.common_utils import AnthropicError
 from openai import APIStatusError, APITimeoutError, PermissionDeniedError
 from openai.types.responses import Response, ResponseCompletedEvent, ResponseCreatedEvent
@@ -636,6 +642,33 @@ def test_litellm_request_size_prefers_the_provider_payload_litellm_built() -> No
     assert "sk-ant-secret" not in str(event.to_dict())
 
 
+def test_litellm_request_size_accepts_the_serialized_payload_streaming_adapters_record() -> None:
+    kwargs = _anthropic_kwargs(None, stream=True)
+    payload = '{"model":"claude-sonnet-4-5","messages":[],"max_tokens":1,"stream":true}'
+    kwargs["additional_args"] = {"complete_input_dict": payload}
+    event = request_log.event_from_litellm(kwargs, _FakeResponse(), None, None, outcome="success")
+    assert event.request_bytes == len(payload.encode())
+
+
+def test_openrouter_generation_id_beats_the_cloudflare_ray() -> None:
+    headers = {"cf-ray": "a3f5d8f23fde88dc-PDX", "x-generation-id": "gen-1790127690-M8vfqPTAr"}
+    assert request_log.request_id_from_reply(headers) == "gen-1790127690-M8vfqPTAr"
+    assert request_log.request_id_from_headers({"cf-ray": "a3f5-PDX"}) is None
+    assert request_log.request_id_from_reply({"cf-ray": "a3f5-PDX"}) == "a3f5-PDX"
+
+
+def test_request_id_in_the_error_body_beats_the_cloudflare_ray() -> None:
+    """A gateway that strips ``request-id`` still forwards Anthropic's body."""
+    body = '{"type":"error","error":{"type":"not_found_error"},"request_id":"req_body1"}'
+    exc = _anthropic_error(404, body, {"cf-ray": "a3f5-PDX", "content-type": "application/json"})
+    event = request_log.event_from_litellm(
+        _anthropic_kwargs(exc), None, None, None, outcome="error"
+    )
+    assert event.provider_request_id == "req_body1"
+    assert request_log.request_id_from_reply({"cf-ray": "a3f5-PDX"}, body) == "req_body1"
+    assert request_log.request_id_from_reply({"cf-ray": "a3f5-PDX"}, "no id here") == "a3f5-PDX"
+
+
 def test_litellm_streaming_time_to_first_token_from_completion_start() -> None:
     kwargs = _anthropic_kwargs(None, stream=True)
     start = datetime(2026, 9, 19, 12, 0, tzinfo=UTC)
@@ -689,13 +722,106 @@ def test_litellm_failure_carries_status_body_size_headers_and_error_details() ->
     assert "sk-ant-secret" not in str(event.to_dict())
 
 
-def test_litellm_failure_without_headers_has_no_headers() -> None:
+def test_litellm_failure_without_a_reply_has_no_status_headers_or_size() -> None:
     exc = APITimeoutError(httpx.Request("POST", "https://api.anthropic.com/v1/messages"))
     kwargs = _anthropic_kwargs(exc)
     kwargs["standard_logging_object"]["error_information"]["error_code"] = ""
     event = request_log.event_from_litellm(kwargs, None, None, None, outcome="error")
+    assert event.status_code is None
     assert event.response_headers is None
-    assert event.response_bytes is not None  # size of the timeout message text
+    assert event.response_bytes is None
+    assert event.error_type == "APITimeoutError"
+
+
+def test_litellm_connection_failure_drops_the_synthetic_500() -> None:
+    exc = LiteLlmConnectionError(
+        message="Connection refused", llm_provider="openrouter", model="openrouter/x"
+    )
+    kwargs = _anthropic_kwargs(exc)
+    event = request_log.event_from_litellm(kwargs, None, None, None, outcome="error")
+    assert exc.status_code == 500
+    assert event.status_code is None
+    assert event.response_bytes is None
+    assert event.provider_request_id is None
+
+
+def test_litellm_timeout_drops_the_synthetic_408() -> None:
+    exc = LiteLlmTimeout(message="Request timed out.", model="x", llm_provider="openrouter")
+    kwargs = _anthropic_kwargs(exc)
+    event = request_log.event_from_litellm(kwargs, None, None, None, outcome="error")
+    assert exc.status_code == 408
+    assert event.status_code is None
+    assert event.response_bytes is None
+
+
+def test_litellm_api_error_with_headers_keeps_its_status() -> None:
+    body = '{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}'
+    exc = LiteLlmApiError(
+        status_code=529,
+        message=f"AnthropicException - b'{body}'",
+        llm_provider="anthropic",
+        model="x",
+    )
+    # LiteLLM's exception mapping attaches the reply's headers this way.
+    exc.litellm_response_headers = {"request-id": "req_529"}  # type: ignore[attr-defined]
+    kwargs = _anthropic_kwargs(exc)
+    event = request_log.event_from_litellm(kwargs, None, None, None, outcome="error")
+    assert event.status_code == 529
+    assert event.provider_request_id == "req_529"
+    assert event.response_bytes == len(body.encode())
+    assert event.details is not None
+    assert event.details["error"]["body"] == {
+        "type": "error",
+        "error": {"type": "overloaded_error"},
+    }
+
+
+def test_litellm_mapped_error_without_a_json_body_has_no_size_but_keeps_its_status() -> None:
+    exc = LiteLlmApiError(
+        status_code=502,
+        message="OpenrouterException - <html>bad gateway</html>",
+        llm_provider="openrouter",
+        model="x",
+    )
+    exc.litellm_response_headers = {"cf-ray": "a3f5-PDX"}  # type: ignore[attr-defined]
+    event = request_log.event_from_litellm(
+        _anthropic_kwargs(exc), None, None, None, outcome="error"
+    )
+    assert event.status_code == 502
+    assert event.response_bytes is None
+    assert event.provider_request_id == "a3f5-PDX"
+    assert event.details is not None
+    assert "body" not in event.details["error"]
+
+
+def test_litellm_mapped_error_sizes_the_body_it_kept_not_its_empty_stand_in_response() -> None:
+    # LiteLLM's mapped exceptions subclass openai.APIStatusError and carry an
+    # httpx.Response with no content; the reply body lives on ``body``/``message``.
+    body = {"error": {"message": "User not found.", "code": 401}}
+    exc = LiteLlmAuthenticationError(
+        message="OpenrouterException - " + json.dumps(body, separators=(",", ":")),
+        llm_provider="openrouter",
+        model="x",
+    )
+    assert isinstance(exc, APIStatusError)
+    assert exc.response.content == b""
+    exc.litellm_response_headers = {"cf-ray": "a3f5-PDX"}  # type: ignore[attr-defined]
+    event = request_log.event_from_litellm(
+        _anthropic_kwargs(exc), None, None, None, outcome="error"
+    )
+    assert event.status_code == 401
+    assert event.response_bytes == len(json.dumps(body, separators=(",", ":")).encode())
+
+
+def test_litellm_host_is_the_configured_endpoint_not_the_provider_default() -> None:
+    # On a non-streamed call through a gateway, LiteLLM's hidden api_base can be
+    # the provider default (api.openai.com) while the call went to the gateway.
+    kwargs = _anthropic_kwargs(None)
+    kwargs["litellm_params"] = {"api_base": "https://openrouter.ai/api/v1/"}
+    kwargs["standard_logging_object"]["api_base"] = "https://openrouter.ai/api/v1"
+    kwargs["standard_logging_object"]["hidden_params"]["api_base"] = "https://api.openai.com"
+    event = request_log.event_from_litellm(kwargs, _FakeResponse(), None, None, outcome="success")
+    assert event.api_host == "openrouter.ai"
 
 
 def test_to_dict_and_log_line_include_new_fields() -> None:
@@ -818,6 +944,42 @@ async def test_openai_route_success_event(captured: list[LlmRequestEvent]) -> No
     assert (event.input_tokens, event.output_tokens, event.total_tokens) == (10, 5, 15)
     assert event.streaming is False
     assert model.model == "gpt-5"
+
+
+@pytest.mark.asyncio
+async def test_openai_route_drops_the_sdk_placeholder_response_id(
+    captured: list[LlmRequestEvent],
+) -> None:
+    """Chat-completions backends get ``__fake_id__`` from the SDK, not a provider id."""
+    model = request_log.RequestLoggingModel(
+        _Inner(response=_openai_response(FAKE_RESPONSES_ID)),
+        model_name="anthropic/claude-sonnet-4-5",
+        provider="openai",
+        base_url="https://openrouter.ai/api/v1",
+    )
+    await model.get_response(*_CALL_ARGS, **_CALL_KWARGS)
+
+    assert len(captured) == 1
+    assert captured[0].response_id is None
+    assert FAKE_RESPONSES_ID not in str(captured[0].to_dict())
+
+
+@pytest.mark.asyncio
+async def test_openai_route_streaming_drops_the_sdk_placeholder_response_id(
+    captured: list[LlmRequestEvent],
+) -> None:
+    model = request_log.RequestLoggingModel(
+        _Inner(stream_events=[_completed_event(FAKE_RESPONSES_ID)]),
+        model_name="anthropic/claude-sonnet-4-5",
+        provider="openai",
+        base_url="https://openrouter.ai/api/v1",
+    )
+    async for _ in model.stream_response(*_CALL_ARGS, **_CALL_KWARGS):
+        pass
+
+    assert len(captured) == 1
+    assert captured[0].response_id is None
+    assert FAKE_RESPONSES_ID not in str(captured[0].to_dict())
 
 
 @pytest.mark.asyncio
