@@ -158,44 +158,16 @@ def test_api_host_never_leaks_path_or_query() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# redaction                                                                    #
+# error message                                                                #
 # --------------------------------------------------------------------------- #
 
 
-@pytest.mark.parametrize(
-    "secret",
-    [
-        "sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789",
-        "sk-proj-abcdefghijklmnopqrstuvwxyz",
-        "Bearer abcdefghijklmnopqrstuvwxyz0123456789",
-        "AKIAABCDEFGHIJKLMNOP",
-        "AIzaSyABCDEFGHIJKLMNOPQRSTUVWXYZ01234",
-        "ghp_abcdefghijklmnopqrstuvwxyz0123456789",
-        "xoxb-1234567890-abcdefghij",
-        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abcdefghijklmnopqrstuvwxyz",
-    ],
-)
-def test_redact_removes_credential_shapes(secret: str) -> None:
-    redacted = request_log.redact(f"upstream said: {secret} (401)")
-    assert secret not in redacted
-    assert "[REDACTED]" in redacted
-    assert "(401)" in redacted
-
-
-def test_redact_key_value_forms_keep_the_key_name() -> None:
-    text = 'invalid "api_key": "abcd1234", authorization: Basic Zm9vOmJhcg== token=abcdef99'
-    redacted = request_log.redact(text)
-    assert "abcd1234" not in redacted
-    assert "Zm9vOmJhcg==" not in redacted
-    assert "abcdef99" not in redacted
-    assert '"api_key": "[REDACTED]"' in redacted
-
-
-def test_clean_error_message_truncates_and_redacts() -> None:
-    exc = RuntimeError("x" * 5000 + " sk-ant-api03-abcdefghijklmnop")
+def test_clean_error_message_truncates_and_keeps_the_text() -> None:
+    exc = RuntimeError("x" * 5000)
     message = request_log.clean_error_message(exc)
     assert len(message) <= request_log.ERROR_MESSAGE_MAX_CHARS
-    assert "sk-ant" not in message
+    assert message.endswith("…")
+    assert request_log.clean_error_message(RuntimeError("upstream 401")) == "upstream 401"
     assert request_log.clean_error_message(RuntimeError("")) == "RuntimeError"
 
 
@@ -313,14 +285,13 @@ def test_litellm_timeout_is_an_error_event_with_no_status() -> None:
     assert event.provider_request_id is None
 
 
-def test_litellm_failure_message_is_redacted() -> None:
-    exc = _anthropic_error(401, "invalid x-api-key: sk-ant-api03-abcdefghijklmnopqrstu")
+def test_litellm_failure_message_is_the_providers_text() -> None:
+    exc = _anthropic_error(401, "invalid x-api-key")
     event = request_log.event_from_litellm(
         _anthropic_kwargs(exc), None, None, None, outcome="error"
     )
     assert event.error_message is not None
-    assert "sk-ant-api03" not in event.error_message
-    assert "[REDACTED]" in event.error_message
+    assert "invalid x-api-key" in event.error_message
 
 
 def test_litellm_streaming_flag_and_call_id() -> None:
@@ -431,7 +402,7 @@ def test_log_line_sink_formats_without_content(caplog: pytest.LogCaptureFixture)
 # --------------------------------------------------------------------------- #
 
 
-def test_response_headers_keep_everything_but_credentials() -> None:
+def test_response_headers_keep_everything_as_sent() -> None:
     picked = request_log.headers_from_response(
         {
             "llm_provider-anthropic-ratelimit-requests-remaining": "49",
@@ -443,17 +414,9 @@ def test_response_headers_keep_everything_but_credentials() -> None:
             "cf-ray": "8f0-FRA",
             "x-should-retry": "false",
             "openai-processing-ms": "812",
-            "x-vendor-new-header": "kept without a code change",
-            "authorization": "Bearer sk-ant-secret",
-            "Proxy-Authorization": "Basic abc",
             "WWW-Authenticate": "Bearer realm=x",
-            "x-api-key": "sk-ant-secret",
-            "api-key": "azure-secret",
-            "set-cookie": "session=abc",
-            "x-session-token": "abc",
-            "x-amz-signature": "sig",
-            "x-goog-api-key": "AIzaSyA-secret-key-value-1234567890",
-            "x-leaky": "token sk-ant-api03-abcdefghijklmnopqrstu inside",
+            "set-cookie": "__cf_bm=abc",
+            "x-vendor-new-header": "kept without a code change",
             "x-empty": "   ",
             "x-object": {"not": "a string"},
         }
@@ -468,10 +431,10 @@ def test_response_headers_keep_everything_but_credentials() -> None:
         "cf-ray": "8f0-FRA",
         "x-should-retry": "false",
         "openai-processing-ms": "812",
+        "www-authenticate": "Bearer realm=x",
+        "set-cookie": "__cf_bm=abc",
         "x-vendor-new-header": "kept without a code change",
-        "x-leaky": "token [REDACTED] inside",
     }
-    assert "secret" not in str(picked)
     assert request_log.headers_from_response({}) is None
     assert request_log.headers_from_response(None) is None
 
@@ -484,7 +447,7 @@ def test_response_headers_are_bounded() -> None:
     assert all(len(v) <= request_log.HEADER_VALUE_MAX_CHARS for v in picked.values())
 
 
-def test_details_drop_content_and_credentials_keep_metadata() -> None:
+def test_details_drop_content_and_the_callers_key_keep_metadata() -> None:
     details = request_log.sanitize_details(
         {
             "max_tokens": 4096,
@@ -494,13 +457,13 @@ def test_details_drop_content_and_credentials_keep_metadata() -> None:
             "tools": [{"name": "t", "input_schema": {}}],
             "api_key": "sk-ant-secret",
             "extra_headers": {"authorization": "Bearer x"},
-            "api_base": "https://gw.example/v1?token=abc#frag",
+            "api_base": "https://gw.example/v1?tenant=abc",
             "usage": {
                 "input_tokens": 10,
                 "cache_creation_input_tokens": 3,
                 "server_tool_use": {"web_search_requests": 1},
             },
-            "note": "leaked sk-ant-api03-abcdefghijklmnopqrstu here",
+            "note": "kept as written",
             "when": datetime(2026, 9, 19, tzinfo=UTC),
             "nested": {"a": {"b": {"c": {"d": {"e": {"f": {"g": 1}}}}}}},
             "empty": {},
@@ -511,13 +474,13 @@ def test_details_drop_content_and_credentials_keep_metadata() -> None:
         "max_tokens": 4096,
         "temperature": 0,
         "thinking": {"type": "enabled", "budget_tokens": 1024},
-        "api_base": "https://gw.example/v1",
+        "api_base": "https://gw.example/v1?tenant=abc",
         "usage": {
             "input_tokens": 10,
             "cache_creation_input_tokens": 3,
             "server_tool_use": {"web_search_requests": 1},
         },
-        "note": "leaked [REDACTED] here",
+        "note": "kept as written",
         "when": "2026-09-19T00:00:00+00:00",
         "nested": {"a": {"b": {"c": {"d": {"e": "…"}}}}},
     }
@@ -565,7 +528,6 @@ def test_litellm_success_carries_sizes_finish_reason_headers_and_details() -> No
             "anthropic-ratelimit-requests-remaining": "49",
             "anthropic-ratelimit-tokens-remaining": "39000",
             "anthropic-organization-id": "org-123",
-            "x-api-key": "sk-ant-secret",
         },
     )
     kwargs["optional_params"] = {
@@ -697,7 +659,6 @@ def test_litellm_failure_carries_status_body_size_headers_and_error_details() ->
             "retry-after": "7",
             "anthropic-ratelimit-requests-remaining": "0",
             "content-type": "application/json",
-            "x-api-key": "sk-ant-secret",
         },
     )
     kwargs = _anthropic_kwargs(exc)
@@ -1073,7 +1034,7 @@ async def test_openai_route_success_reads_request_id_and_headers_from_the_wire(
             "x-request-id": "req_wire_ok",
             "openai-processing-ms": "812",
             "x-ratelimit-remaining-tokens": "999",
-            "Set-Cookie": "session=abc",
+            "Set-Cookie": "__cf_bm=abc",
         },
     )
     model = request_log.RequestLoggingModel(
@@ -1092,7 +1053,7 @@ async def test_openai_route_success_reads_request_id_and_headers_from_the_wire(
     assert event.response_headers is not None
     assert event.response_headers["openai-processing-ms"] == "812"
     assert event.response_headers["x-ratelimit-remaining-tokens"] == "999"
-    assert "set-cookie" not in event.response_headers
+    assert event.response_headers["set-cookie"] == "__cf_bm=abc"
 
 
 @pytest.mark.asyncio
@@ -1487,12 +1448,10 @@ def test_failure_text_does_not_duplicate_body_id() -> None:
     assert "[provider request id" not in text
 
 
-def test_failure_text_uses_litellm_exception_headers_and_redacts() -> None:
-    exc = _anthropic_error(
-        401, "bad key sk-ant-api03-abcdefghijklmnopqrstu", {"request-id": "req_exc_hdr"}
-    )
+def test_failure_text_uses_litellm_exception_headers() -> None:
+    exc = _anthropic_error(401, "bad key", {"request-id": "req_exc_hdr"})
     text = request_log.failure_text(exc)
-    assert "sk-ant-api03" not in text
+    assert "bad key" in text
     assert text.endswith("[provider request id: req_exc_hdr]")
 
 

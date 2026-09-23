@@ -1,4 +1,4 @@
-"""Structured, secret-free record of every model provider call.
+"""Structured record of every model provider call.
 
 One :class:`LlmRequestEvent` per HTTP attempt against a provider, whatever the
 route (LiteLLM or the native OpenAI client) and whatever the outcome. Retries
@@ -9,12 +9,12 @@ provider's support team asks for when a call was blocked or misbehaved.
 
 The typed fields are the common ground every provider shares (status, ids,
 timing, sizes, tokens, cost). Everything else a provider or SDK reports about
-the attempt travels free-form: the response headers minus credential-bearing
-names, and a ``details`` object with the request parameters, the full usage
-object, the SDK's hidden parameters and the error body. Content (prompts,
-completions, tool arguments) and credentials are removed from both, values are
-redacted and every string, list and object is bounded. Raw request and
-response bodies are never captured.
+the attempt travels free-form: the response headers, and a ``details`` object
+with the request parameters, the full usage object, the SDK's hidden
+parameters and the error body. Content (prompts, completions, tool arguments)
+and the caller's own credentials are left out of both by key name, and every
+string, list and object is bounded. Raw request and response bodies are never
+captured.
 
 Sinks are plain callables. The built-in sink writes one log line per event;
 deployments register their own (a database, a queue) with
@@ -110,11 +110,10 @@ class LlmRequestEvent:
     # Streamed calls only.
     time_to_first_token_ms: int | None = None
     finish_reason: str | None = None
-    # Every response header the provider sent, name-normalized, minus
-    # credential-bearing names; values redacted and capped.
+    # Every response header the provider sent, name-normalized, values capped.
     response_headers: dict[str, str] | None = None
     # Free-form: request parameters, full usage object, SDK hidden params,
-    # error body ... with content and credentials removed and sizes bounded.
+    # error body ... with content removed and sizes bounded.
     details: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -213,41 +212,8 @@ def emit(event: LlmRequestEvent) -> None:
             logger.exception("LLM request log sink %r failed", sink)
 
 
-# --------------------------------------------------------------------------- #
-# Redaction                                                                    #
-# --------------------------------------------------------------------------- #
-
-# Credential shapes a provider or gateway error may echo back. Broad by design:
-# a redacted-but-useless message costs nothing, a leaked key costs a rotation.
-_SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"(?i)\b(?:bearer|basic)\s+[a-z0-9._~+/=-]{8,}"),
-    re.compile(r"\bsk-(?:ant-|proj-|or-v1-)?[A-Za-z0-9_-]{8,}"),
-    re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"),
-    re.compile(r"\bAIza[0-9A-Za-z_-]{20,}\b"),
-    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"),
-    re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}\b"),
-    re.compile(r"\bey[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"),
-    re.compile(
-        r"(?i)([\"']?(?:api[_-]?key|x-api-key|authorization|api[_-]?token|secret|password)"
-        r"[\"']?\s*[:=]\s*[\"']?)(?:(?:bearer|basic)\s+)?[^\s\"',;&]{4,}"
-    ),
-    re.compile(r"(?i)((?:api[_-]?key|token|secret|password)=)[^&\s\"']{4,}"),
-)
-
-
-def redact(text: str) -> str:
-    """Replace anything credential-shaped in ``text``."""
-    for pattern in _SECRET_PATTERNS:
-        if pattern.groups:
-            text = pattern.sub(lambda m: f"{m.group(1)}[REDACTED]", text)
-        else:
-            text = pattern.sub("[REDACTED]", text)
-    return text
-
-
 def clean_error_message(exc: BaseException) -> str:
     message = str(exc).strip() or type(exc).__name__
-    message = redact(message)
     if len(message) > ERROR_MESSAGE_MAX_CHARS:
         message = message[: ERROR_MESSAGE_MAX_CHARS - 1] + "…"
     return message
@@ -324,20 +290,6 @@ def request_id_from_reply(headers: Mapping[str, Any] | None, text: str | None = 
 
 FINISH_REASON_MAX_CHARS = 128
 
-# Response headers are kept whole, except names that carry a credential. The
-# list is a deny-list on purpose: a provider's new telemetry header should show
-# up without a code change, a leaked credential must not.
-_DENIED_HEADER_FRAGMENTS: tuple[str, ...] = (
-    "auth",  # authorization, proxy-authorization, www-authenticate, x-auth-token
-    "cookie",
-    "api-key",
-    "apikey",
-    "secret",
-    "password",
-    "credential",
-    "signature",
-    "session",
-)
 HEADERS_MAX_COUNT = 64
 HEADER_VALUE_MAX_CHARS = 512
 
@@ -375,21 +327,10 @@ _CONTENT_KEYS: frozenset[str] = frozenset(
         "original_response",
     }
 )
-# Keys whose value is or may hold a credential, whatever the provider calls it.
-_SECRET_KEY_FRAGMENTS: tuple[str, ...] = (
-    "api_key",
-    "api-key",
-    "apikey",
-    "authorization",
-    "secret",
-    "password",
-    "credential",
-    "cookie",
-    "headers",  # request header blocks carry the auth header
-    "access_token",
-    "refresh_token",
-    "id_token",
-    "bearer",
+# Request parameters that hold the caller's own credential: the key itself and
+# the header block (``extra_headers``) the authorization header travels in.
+_CREDENTIAL_KEYS: frozenset[str] = frozenset(
+    {"api_key", "authorization", "extra_headers", "headers"}
 )
 DETAILS_MAX_BYTES = 16 * 1024
 DETAILS_MAX_DEPTH = 6
@@ -402,7 +343,7 @@ def _normalize_header_name(key: object) -> str:
 
 
 def headers_from_response(headers: Mapping[str, Any] | None) -> dict[str, str] | None:
-    """The provider's response headers, minus credential-bearing names, redacted and capped."""
+    """The provider's response headers, name-normalized and value-capped."""
     if not headers:
         return None
     picked: dict[str, str] = {}
@@ -413,30 +354,19 @@ def headers_from_response(headers: Mapping[str, Any] | None) -> dict[str, str] |
         if not text:
             continue
         name = _normalize_header_name(key)
-        if not name or any(fragment in name for fragment in _DENIED_HEADER_FRAGMENTS):
+        if not name:
             continue
-        picked.setdefault(name, redact(text)[:HEADER_VALUE_MAX_CHARS])
+        picked.setdefault(name, text[:HEADER_VALUE_MAX_CHARS])
         if len(picked) >= HEADERS_MAX_COUNT:
             break
     return picked or None
-
-
-def _strip_url_secrets(text: str) -> str:
-    """Drop the query and fragment of anything URL-shaped; gateways key on them."""
-    if "://" not in text:
-        return text
-    try:
-        parts = urlsplit(text)
-    except ValueError:
-        return text
-    return parts._replace(query="", fragment="").geturl()
 
 
 def _sanitize_value(value: object, depth: int) -> object:  # noqa: PLR0911
     if value is None or isinstance(value, bool | int | float):
         return value
     if isinstance(value, str):
-        return redact(_strip_url_secrets(value))[:DETAILS_MAX_STRING]
+        return value[:DETAILS_MAX_STRING]
     if isinstance(value, datetime | date):
         return value.isoformat()
     if depth >= DETAILS_MAX_DEPTH:
@@ -450,7 +380,7 @@ def _sanitize_value(value: object, depth: int) -> object:  # noqa: PLR0911
         for raw_key, item in cast("Mapping[object, object]", value).items():
             key = str(raw_key)
             lowered = key.lower()
-            if lowered in _CONTENT_KEYS or any(f in lowered for f in _SECRET_KEY_FRAGMENTS):
+            if lowered in _CONTENT_KEYS or lowered in _CREDENTIAL_KEYS:
                 continue
             cleaned = _sanitize_value(item, depth + 1)
             if cleaned is None or cleaned in ({}, []):
@@ -462,14 +392,14 @@ def _sanitize_value(value: object, depth: int) -> object:  # noqa: PLR0911
     if isinstance(value, Sequence | set | frozenset):
         items = list(cast("Sequence[object]", value))[:DETAILS_MAX_ITEMS]
         return [_sanitize_value(item, depth + 1) for item in items]
-    return redact(str(value))[:DETAILS_MAX_STRING]
+    return str(value)[:DETAILS_MAX_STRING]
 
 
 def sanitize_details(value: object) -> dict[str, Any] | None:
-    """A bounded, content-free, credential-free copy of ``value`` (a mapping), or None.
+    """A bounded, content-free copy of ``value`` (a mapping), or None.
 
-    Content keys and secret-shaped keys are dropped by name, strings are
-    redacted and capped, nesting, item counts and total size are bounded. When
+    Content keys and the caller's credential keys are dropped by name, strings
+    are capped, nesting, item counts and total size are bounded. When
     the copy is still too large the biggest top-level entries go first and
     their names are listed under ``_dropped``.
     """
@@ -928,7 +858,7 @@ def _litellm_failure(
     error_type = error_type or _str_or_none(error_info.get("error_class")) or "Exception"
     if error_message is None:
         raw = _str_or_none(error_info.get("error_message")) or _str_or_none(slo.get("error_str"))
-        error_message = redact(raw)[:ERROR_MESSAGE_MAX_CHARS] if raw else error_type
+        error_message = raw[:ERROR_MESSAGE_MAX_CHARS] if raw else error_type
     provider = _str_or_none(error_info.get("llm_provider"))
     if provider:
         error.setdefault("llm_provider", provider)
@@ -1498,7 +1428,7 @@ def failure_text(exc: BaseException) -> str:
     ``request_id``) but drops the ``request-id`` header; OpenAI errors carry
     only the header. Either way the id lands in the text an operator reads.
     """
-    text = redact(str(exc)) or type(exc).__name__
+    text = str(exc) or type(exc).__name__
     request_id: str | None = None
     if isinstance(exc, APIError):
         _, request_id = _openai_error_fields(exc)
@@ -1527,7 +1457,6 @@ __all__ = [
     "json_size",
     "json_text",
     "merge_details",
-    "redact",
     "register_sink",
     "request_id_from_headers",
     "request_id_from_reply",
