@@ -6,6 +6,7 @@ import dataclasses
 import inspect
 import json
 import logging
+import os
 import re
 from typing import TYPE_CHECKING, Any
 
@@ -700,6 +701,8 @@ def build_strix_agent(
         tools: list[Tool] = [*_BASE_TOOLS, *agent_tools, finish_scan]
     else:
         tools = [*_BASE_TOOLS, *agent_tools, agent_finish]
+    if os.environ.get("STRIX_SINGLE_AGENT") == "1":
+        tools = [tool for tool in tools if getattr(tool, "name", None) != "create_agent"]
     _ensure_unique_tool_names(tools)
     tools = [
         _with_bounded_result(_with_strictness(_with_coerced_arguments(tool), strict_tool_schemas))

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 from jinja2 import Environment, FileSystemLoader, select_autoescape
@@ -54,7 +55,7 @@ def _resolve_skills(
     ordered.append("tooling/python")
     ordered.append("analysis/counterevidence")
     ordered.append("analysis/severity_calibration")
-    if is_root:
+    if is_root and os.environ.get("STRIX_SINGLE_AGENT") != "1":
         ordered.append("coordination/root_agent")
     if is_whitebox:
         ordered.append("coordination/source_aware_whitebox")
@@ -123,4 +124,19 @@ def render_system_prompt(
             len(skill_content),
             len(rendered),
         )
+        if os.environ.get("STRIX_SINGLE_AGENT") == "1":
+            rendered += """
+<single_agent_policy>
+Single-agent mode is enforced by the runtime. This policy supersedes all
+delegation, root-orchestration-only, specialist-chain, and separate-validator
+requirements in the preceding workflow and skills. The root performs authorized
+reconnaissance, HTTP/browser requests, source analysis, local validation, and
+reporting itself, sequentially, using its shell and other tools. Do not spawn
+or wait for child agents. Load relevant skills inline. Validate findings with
+evidence yourself; independent-agent validation is unavailable and must not
+be claimed. File validated findings yourself and call finish_scan as the root.
+Retain every scope, authorization, evidence, and resource constraint. A blocked
+spawn is not a reason to skip tests that the root can execute directly.
+</single_agent_policy>
+"""
         return str(rendered)

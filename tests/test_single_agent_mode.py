@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 from agents import RunConfig
 
+from strix.agents.factory import build_strix_agent
 from strix.core.agents import AgentCoordinator
 from strix.core.execution import respawn_subagents, spawn_child_agent
 
@@ -85,3 +86,21 @@ async def test_default_spawning_is_unchanged(monkeypatch, tmp_path, policy):
     assert result["success"] is True
     starter.assert_awaited_once()
     assert len(coordinator.statuses) == 2
+
+
+def test_single_agent_root_can_test_without_delegation(monkeypatch):
+    monkeypatch.setenv("STRIX_SINGLE_AGENT", "1")
+    agent = build_strix_agent(is_root=True, scan_mode="standard", is_whitebox=True)
+    assert "create_agent" not in [tool.name for tool in agent.tools]
+    assert "finish_scan" in [tool.name for tool in agent.tools]
+    assert "<single_agent_policy>" in agent.instructions
+    assert "HTTP/browser requests" in agent.instructions
+    assert "<root_agent>" not in agent.instructions
+    assert agent.capabilities
+
+
+def test_default_root_still_supports_delegation(monkeypatch):
+    monkeypatch.delenv("STRIX_SINGLE_AGENT", raising=False)
+    agent = build_strix_agent(is_root=True, scan_mode="standard")
+    assert "create_agent" in [tool.name for tool in agent.tools]
+    assert "<single_agent_policy>" not in agent.instructions

@@ -383,3 +383,7 @@ Set `STRIX_SINGLE_AGENT=1` to reject child-agent creation before construction or
 registration. The root must perform the review itself. Resuming a run that would
 restart child agents fails explicitly; start a fresh single-agent run instead.
 The default remains unchanged when this variable is absent.
+
+In single-agent mode the root receives a sequential hands-on workflow and no
+`create_agent` tool. Its prompt explicitly replaces delegation requirements while
+preserving authorization, scope, evidence and resource constraints.
