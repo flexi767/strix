@@ -538,10 +538,22 @@ class StrixProvider(MultiProvider):
             )
         else:
             model = super().get_model(model_name)
-            if not _routes_via_litellm(model):
+            resolved_name = model_name or llm.model or "unknown"
+            if _routes_via_litellm(model):
+                # LiteLLM's callbacks log every reply; only a cancelled attempt
+                # (stream idle timeout, abandoned turn) escapes them.
                 model = request_log.RequestLoggingModel(
                     model,
-                    model_name=model_name or llm.model or "unknown",
+                    model_name=resolved_name,
+                    provider=_litellm_provider(resolved_name),
+                    base_url=self._override_base_url or llm.api_base,
+                    route="litellm",
+                    abandoned_only=True,
+                )
+            else:
+                model = request_log.RequestLoggingModel(
+                    model,
+                    model_name=resolved_name,
                     provider="openai",
                     base_url=self._override_base_url or llm.api_base,
                 )
@@ -563,6 +575,16 @@ def _routes_via_litellm(model: Model) -> bool:
     from agents.extensions.models.litellm_model import LitellmModel
 
     return isinstance(model, LitellmModel)
+
+
+def _litellm_provider(model_name: str) -> str | None:
+    """The provider LiteLLM will route ``model_name`` to, if it can tell."""
+    try:
+        import litellm
+
+        return str(litellm.get_llm_provider(model_name)[1])
+    except Exception:  # noqa: BLE001 - unknown model ids are the provider's problem, not the log's
+        return None
 
 
 DEFAULT_MODEL_RETRY = ModelRetrySettings(
@@ -794,12 +816,16 @@ def _merge_litellm_headers(headers: dict[str, str]) -> None:
 
 def _register_openai_client_with_headers(llm: LlmSettings, headers: dict[str, str]) -> None:
     from agents import set_default_openai_client
+    from agents.models.openai_provider import shared_http_client
     from openai import AsyncOpenAI
 
     client = AsyncOpenAI(
         api_key=llm.api_key or "not-needed",
         base_url=llm.api_base,
         default_headers=dict(headers),
+        # The SDK's shared client is the one the request log observes for
+        # reply status, headers and provider request ids.
+        http_client=shared_http_client(),
     )
     set_default_openai_client(client, use_for_tracing=False)
 

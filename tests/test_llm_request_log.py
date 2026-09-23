@@ -4,13 +4,16 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import httpx
 import litellm
 import pytest
 from agents.items import ModelResponse
+from agents.models import _openai_shared
 from agents.models.interface import Model
+from agents.models.openai_provider import shared_http_client
 from agents.tool import FunctionTool
 from agents.usage import Usage
 from litellm.llms.anthropic.common_utils import AnthropicError
@@ -18,11 +21,12 @@ from openai import APIStatusError, APITimeoutError, PermissionDeniedError
 from openai.types.responses import Response, ResponseCompletedEvent, ResponseCreatedEvent
 from openai.types.responses.response import IncompleteDetails
 
+from strix.config import codex, models
 from strix.llm import request_log
 
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Iterator
+    from collections.abc import AsyncGenerator, AsyncIterator, Iterator
 
     from strix.llm.request_log import LlmRequestEvent
 
@@ -854,13 +858,256 @@ async def test_openai_route_timeout_event(captured: list[LlmRequestEvent]) -> No
 
 
 @pytest.mark.asyncio
-async def test_openai_route_cancellation_is_not_logged(captured: list[LlmRequestEvent]) -> None:
+async def test_openai_route_cancellation_is_logged_as_an_abandoned_attempt(
+    captured: list[LlmRequestEvent],
+) -> None:
     model = request_log.RequestLoggingModel(
         _Inner(exc=asyncio.CancelledError()), model_name="gpt-5", provider="openai", base_url=None
     )
     with pytest.raises(asyncio.CancelledError):
         await model.get_response(*_CALL_ARGS, **_CALL_KWARGS)
+
+    assert len(captured) == 1
+    event = captured[0]
+    assert event.outcome == "error"
+    assert event.error_type == "CancelledError"
+    assert event.status_code is None
+    assert "cancelled" in (event.error_message or "")
+    assert event.request_bytes is not None
+
+
+class _ReplyingInner(_Inner):
+    """Behaves like the OpenAI SDK: the wire reply is only visible to the httpx hook."""
+
+    def __init__(self, *, reply: httpx.Response, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._reply = reply
+
+    async def get_response(self, *args: Any, **kwargs: Any) -> ModelResponse:
+        await request_log.record_http_reply(self._reply)
+        return await super().get_response(*args, **kwargs)
+
+    async def stream_response(self, *args: Any, **kwargs: Any) -> AsyncIterator[Any]:
+        await request_log.record_http_reply(self._reply)
+        async for event in super().stream_response(*args, **kwargs):
+            yield event
+
+
+def _wire_reply(status: int, headers: dict[str, str]) -> httpx.Response:
+    return httpx.Response(
+        status,
+        request=httpx.Request("POST", "https://api.openai.com/v1/responses"),
+        headers=headers,
+    )
+
+
+@pytest.mark.asyncio
+async def test_openai_route_success_reads_request_id_and_headers_from_the_wire(
+    captured: list[LlmRequestEvent],
+) -> None:
+    reply = _wire_reply(
+        200,
+        {
+            "x-request-id": "req_wire_ok",
+            "openai-processing-ms": "812",
+            "x-ratelimit-remaining-tokens": "999",
+            "Set-Cookie": "session=abc",
+        },
+    )
+    model = request_log.RequestLoggingModel(
+        _ReplyingInner(reply=reply, response=_openai_response("resp_wire")),
+        model_name="gpt-5",
+        provider="openai",
+        base_url=None,
+    )
+    await model.get_response(*_CALL_ARGS, **_CALL_KWARGS)
+
+    event = captured[0]
+    assert event.outcome == "success"
+    assert event.status_code == 200
+    assert event.provider_request_id == "req_wire_ok"
+    assert event.response_id == "resp_wire"
+    assert event.response_headers is not None
+    assert event.response_headers["openai-processing-ms"] == "812"
+    assert event.response_headers["x-ratelimit-remaining-tokens"] == "999"
+    assert "set-cookie" not in event.response_headers
+
+
+@pytest.mark.asyncio
+async def test_openai_route_streaming_success_reads_request_id_from_the_wire(
+    captured: list[LlmRequestEvent],
+) -> None:
+    reply = _wire_reply(200, {"x-request-id": "req_wire_stream"})
+    model = request_log.RequestLoggingModel(
+        _ReplyingInner(reply=reply, stream_events=[_completed_event("resp_s")]),
+        model_name="gpt-5",
+        provider="openai",
+        base_url=None,
+    )
+    _ = [e async for e in model.stream_response(*_CALL_ARGS, **_CALL_KWARGS)]
+
+    assert captured[0].provider_request_id == "req_wire_stream"
+    assert captured[0].response_id == "resp_s"
+    assert captured[0].response_headers == {"x-request-id": "req_wire_stream"}
+
+
+@pytest.mark.asyncio
+async def test_openai_route_cancel_midstream_keeps_the_wire_status_and_request_id(
+    captured: list[LlmRequestEvent],
+) -> None:
+    reply = _wire_reply(200, {"x-request-id": "req_wire_cancel"})
+    created = ResponseCreatedEvent(
+        response=_completed_event("resp_c").response, sequence_number=0, type="response.created"
+    )
+    model = request_log.RequestLoggingModel(
+        _ReplyingInner(
+            reply=reply,
+            stream_events=[created, created],
+            exc=asyncio.CancelledError(),
+            fail_after=1,
+        ),
+        model_name="gpt-5",
+        provider="openai",
+        base_url=None,
+    )
+    with pytest.raises(asyncio.CancelledError):
+        async for _ in model.stream_response(*_CALL_ARGS, **_CALL_KWARGS):
+            pass
+
+    event = captured[0]
+    assert event.outcome == "error"
+    assert event.error_type == "CancelledError"
+    assert event.status_code == 200
+    assert event.provider_request_id == "req_wire_cancel"
+    assert event.streaming is True
+    assert event.time_to_first_token_ms is not None
+
+
+@pytest.mark.asyncio
+async def test_openai_route_error_prefers_exception_fields_over_the_wire_reply(
+    captured: list[LlmRequestEvent],
+) -> None:
+    exc = _openai_status_error(429, "req_exc")
+    model = request_log.RequestLoggingModel(
+        _ReplyingInner(reply=_wire_reply(200, {"x-request-id": "req_stale"}), exc=exc),
+        model_name="gpt-5",
+        provider="openai",
+        base_url=None,
+    )
+    with pytest.raises(APIStatusError):
+        await model.get_response(*_CALL_ARGS, **_CALL_KWARGS)
+    assert captured[0].status_code == 429
+    assert captured[0].provider_request_id == "req_exc"
+
+
+@pytest.mark.asyncio
+async def test_http_reply_hook_ignores_requests_outside_an_attempt() -> None:
+    await request_log.record_http_reply(_wire_reply(500, {"x-request-id": "req_nobody"}))
+    assert request_log._http_reply.get() is None
+
+
+@pytest.mark.asyncio
+async def test_http_reply_is_scoped_to_the_attempt_that_awaits_it(
+    captured: list[LlmRequestEvent],
+) -> None:
+    def _model(request_id: str, response_id: str) -> request_log.RequestLoggingModel:
+        return request_log.RequestLoggingModel(
+            _ReplyingInner(
+                reply=_wire_reply(200, {"x-request-id": request_id}),
+                response=_openai_response(response_id),
+            ),
+            model_name="gpt-5",
+            provider="openai",
+            base_url=None,
+        )
+
+    await asyncio.gather(
+        _model("req_a", "resp_a").get_response(*_CALL_ARGS, **_CALL_KWARGS),
+        _model("req_b", "resp_b").get_response(*_CALL_ARGS, **_CALL_KWARGS),
+    )
+    by_response = {e.response_id: e.provider_request_id for e in captured}
+    assert by_response == {"resp_a": "req_a", "resp_b": "req_b"}
+    assert request_log._http_reply.get() is None
+
+
+def test_observe_http_client_installs_the_hook_once() -> None:
+    client = httpx.AsyncClient()
+    request_log.observe_http_client(client)
+    request_log.observe_http_client(client)
+    assert client.event_hooks["response"].count(request_log.record_http_reply) == 1
+
+
+def test_install_observes_the_sdk_shared_http_client() -> None:
+    request_log.install()
+    assert request_log.record_http_reply in shared_http_client().event_hooks["response"]
+
+
+@pytest.mark.asyncio
+async def test_litellm_route_wrapper_only_logs_abandoned_attempts(
+    captured: list[LlmRequestEvent],
+) -> None:
+    ok = request_log.RequestLoggingModel(
+        _Inner(response=_openai_response("resp_ok")),
+        model_name="anthropic/claude-sonnet-4-5",
+        provider="anthropic",
+        base_url=None,
+        route="litellm",
+        abandoned_only=True,
+    )
+    await ok.get_response(*_CALL_ARGS, **_CALL_KWARGS)
+    failed = request_log.RequestLoggingModel(
+        _Inner(exc=_openai_status_error(500, "req_litellm_handles_this")),
+        model_name="anthropic/claude-sonnet-4-5",
+        provider="anthropic",
+        base_url=None,
+        route="litellm",
+        abandoned_only=True,
+    )
+    with pytest.raises(APIStatusError):
+        await failed.get_response(*_CALL_ARGS, **_CALL_KWARGS)
     assert captured == []
+
+    cancelled = request_log.RequestLoggingModel(
+        _Inner(stream_events=[_completed_event("r")], exc=asyncio.CancelledError(), fail_after=0),
+        model_name="anthropic/claude-sonnet-4-5",
+        provider="anthropic",
+        base_url="https://api.anthropic.com",
+        route="litellm",
+        abandoned_only=True,
+    )
+    with pytest.raises(asyncio.CancelledError):
+        async for _ in cancelled.stream_response(*_CALL_ARGS, **_CALL_KWARGS):
+            pass
+
+    assert len(captured) == 1
+    event = captured[0]
+    assert event.route == "litellm"
+    assert event.provider == "anthropic"
+    assert event.api_host == "api.anthropic.com"
+    assert event.outcome == "error"
+    assert event.error_type == "CancelledError"
+    assert event.streaming is True
+    assert event.request_bytes is not None
+
+
+@pytest.mark.asyncio
+async def test_stream_closed_early_is_logged_as_abandoned(captured: list[LlmRequestEvent]) -> None:
+    created = ResponseCreatedEvent(
+        response=_completed_event("resp_e").response, sequence_number=0, type="response.created"
+    )
+    model = request_log.RequestLoggingModel(
+        _Inner(stream_events=[created, created, created]),
+        model_name="gpt-5",
+        provider="openai",
+        base_url=None,
+    )
+    stream = cast("AsyncGenerator[Any, None]", model.stream_response(*_CALL_ARGS, **_CALL_KWARGS))
+    await stream.__anext__()
+    await stream.aclose()
+
+    assert len(captured) == 1
+    assert captured[0].error_type == "GeneratorExit"
+    assert "closed by the caller" in (captured[0].error_message or "")
 
 
 @pytest.mark.asyncio
@@ -1090,3 +1337,22 @@ def test_failure_text_uses_litellm_exception_headers_and_redacts() -> None:
 def test_failure_text_plain_exception_unchanged() -> None:
     assert request_log.failure_text(RuntimeError("boom")) == "boom"
     assert request_log.failure_text(RuntimeError("")) == "RuntimeError"
+
+
+def test_extra_headers_openai_client_rides_the_observed_shared_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request_log.install()
+    monkeypatch.setattr(_openai_shared, "_default_openai_client", None)
+    settings = SimpleNamespace(api_key="k", api_base="https://gateway.example/v1")
+    models._register_openai_client_with_headers(cast("Any", settings), {"X-Gateway-Feature": "svc"})
+    client = _openai_shared.get_default_openai_client()
+    assert client is not None
+    assert client._client is shared_http_client()
+    assert request_log.record_http_reply in client._client.event_hooks["response"]
+
+
+def test_codex_client_is_observed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(codex, "get_valid_token", lambda: ("access", "acct"))
+    client = codex.build_openai_client()
+    assert request_log.record_http_reply in client._client.event_hooks["response"]

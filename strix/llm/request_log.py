@@ -55,6 +55,7 @@ if TYPE_CHECKING:
     from agents.models.interface import ModelTracing
     from agents.retry import ModelRetryAdvice, ModelRetryAdviceRequest
     from agents.tool import Tool
+    from httpx import AsyncClient, Response
     from openai.types.responses import ResponsePromptParam
 
 
@@ -146,6 +147,45 @@ def reset_call_context(token: Token[LlmCallContext]) -> None:
 def set_retry_attempt(attempt: int) -> None:
     """Stamp subsequent calls with the turn-replay number (0 = first try)."""
     _call_context.set(replace(current_call_context(), retry_attempt=attempt))
+
+
+@dataclass
+class HttpReply:
+    """Status and headers of the last provider reply received during one attempt.
+
+    The OpenAI SDK hands its callers a parsed body only; the reply's status and
+    headers (and with them ``x-request-id``) exist solely on the wire. An
+    httpx response hook records them here for the attempt awaiting them.
+    """
+
+    status_code: int | None = None
+    headers: dict[str, str] | None = None
+
+
+_http_reply: ContextVar[HttpReply | None] = ContextVar("strix_llm_http_reply", default=None)
+
+
+async def record_http_reply(response: Response) -> None:
+    """httpx ``response`` event hook: remember the reply for the attempt in flight.
+
+    Hooks run on the task that awaits the request, so the holder set by that
+    task's :class:`RequestLoggingModel` is the one in scope. Replies to
+    requests made outside a logged attempt are ignored.
+    """
+    reply = _http_reply.get()
+    if reply is None:
+        return
+    reply.status_code = response.status_code
+    reply.headers = dict(response.headers.items())
+
+
+def observe_http_client(client: AsyncClient) -> None:
+    """Make every reply ``client`` receives visible to the attempt that awaits it."""
+    hooks = client.event_hooks
+    response_hooks = list(hooks.get("response", []))
+    if record_http_reply in response_hooks:
+        return
+    client.event_hooks = {**hooks, "response": [*response_hooks, record_http_reply]}
 
 
 def current_call_context() -> LlmCallContext:
@@ -883,10 +923,12 @@ _litellm_logger: Any | None = None
 
 
 def install() -> None:
-    """Attach the LiteLLM capture (idempotent) and the default log-line sink."""
+    """Attach the LiteLLM capture (idempotent), the native-route reply capture
+    and the default log-line sink."""
     global _litellm_logger  # noqa: PLW0603
     if _log_line_sink not in _sinks:
         _sinks.insert(0, _log_line_sink)
+    _observe_sdk_shared_http_client()
     if _litellm_logger is not None:
         return
     import litellm
@@ -897,6 +939,16 @@ def install() -> None:
     callbacks = litellm.callbacks  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
     if capture not in callbacks:
         callbacks.append(capture)  # pyright: ignore[reportUnknownMemberType]
+
+
+def _observe_sdk_shared_http_client() -> None:
+    """The agents SDK's default OpenAI client rides one shared httpx client."""
+    try:
+        from agents.models.openai_provider import shared_http_client
+
+        observe_http_client(shared_http_client())
+    except Exception:  # noqa: BLE001 - a missing hook degrades to inferred status/no id
+        logger.warning("could not observe the SDK's shared HTTP client", exc_info=True)
 
 
 def _log_line_sink(event: LlmRequestEvent) -> None:
@@ -972,19 +1024,38 @@ def _openai_usage(response: ModelResponse) -> dict[str, int | None]:
 
 
 class RequestLoggingModel(Model):
-    """Wrap a Model whose calls do not pass through LiteLLM.
+    """Record one event per attempt around a Model's ``get_response`` and
+    ``stream_response``.
 
-    The native OpenAI Responses / Chat Completions routes (``openai/…``, the
-    ChatGPT subscription backend) never hit ``litellm.acompletion``, so the
-    LiteLLM capture does not see them. This wrapper records the same event
-    around each ``get_response`` and ``stream_response``.
+    On the native OpenAI Responses / Chat Completions routes (``openai/…``, the
+    ChatGPT subscription backend) nothing passes through ``litellm.acompletion``,
+    so this wrapper is the capture: it emits every outcome and reads the
+    reply's status and headers from the :class:`HttpReply` the httpx hook
+    fills in.
+
+    On the LiteLLM route LiteLLM's own callbacks report successes and
+    failures, but LiteLLM has no callback for an attempt that is cancelled
+    (the stream idle timeout, an abandoned turn, shutdown); with
+    ``abandoned_only=True`` the wrapper fills exactly that gap and stays
+    silent otherwise.
     """
 
-    def __init__(self, inner: Model, *, model_name: str, provider: str, base_url: str | None):
+    def __init__(
+        self,
+        inner: Model,
+        *,
+        model_name: str,
+        provider: str | None,
+        base_url: str | None,
+        route: Route = "openai",
+        abandoned_only: bool = False,
+    ):
         self._inner = inner
         self._model_name = model_name
         self._provider = provider
         self._host = api_host(base_url) or ("api.openai.com" if provider == "openai" else None)
+        self._route: Route = route
+        self._abandoned_only = abandoned_only
 
     @property
     def model(self) -> str:
@@ -1005,6 +1076,7 @@ class RequestLoggingModel(Model):
         response: ModelResponse | None,
         exc: BaseException | None,
         request: _OpenAiRequest,
+        reply: HttpReply,
         first_event_mono: float | None = None,
         finish_reason: str | None = None,
         raw_response: object = None,
@@ -1019,14 +1091,14 @@ class RequestLoggingModel(Model):
         context = current_call_context()
         base = LlmRequestEvent(
             call_id=str(uuid.uuid4()),
-            route="openai",
+            route=self._route,
             provider=self._provider,
             model=self._model_name,
             api_host=self._host,
             streaming=streaming,
             outcome="success",
-            status_code=200,
-            provider_request_id=None,
+            status_code=reply.status_code or 200,
+            provider_request_id=request_id_from_headers(reply.headers),
             response_id=None,
             error_type=None,
             error_message=None,
@@ -1039,6 +1111,7 @@ class RequestLoggingModel(Model):
             request_bytes=request.size,
             time_to_first_token_ms=ttft_ms,
             finish_reason=finish_reason,
+            response_headers=headers_from_response(reply.headers),
         )
         if exc is None:
             usage = _openai_usage(response) if response is not None else {}
@@ -1062,15 +1135,18 @@ class RequestLoggingModel(Model):
                 ),
             )
         status, request_id = _openai_error_fields(exc)
+        error_headers = _openai_error_headers(exc)
         return replace(
             base,
             outcome="error",
-            status_code=status,
-            provider_request_id=request_id,
+            # A reply the hook saw but the SDK turned into an exception (a
+            # cancel mid-stream, an unparsable 200) keeps its wire status.
+            status_code=status if status is not None else reply.status_code,
+            provider_request_id=request_id or base.provider_request_id,
             error_type=type(exc).__name__,
-            error_message=clean_error_message(exc),
+            error_message=_abandonment_message(exc) or clean_error_message(exc),
             response_bytes=_exception_body_size(exc),
-            response_headers=headers_from_response(_openai_error_headers(exc)),
+            response_headers=headers_from_response(error_headers) or base.response_headers,
             details=merge_details(
                 ("request", request.details),
                 ("error", _exception_details(exc)),
@@ -1115,6 +1191,9 @@ class RequestLoggingModel(Model):
         details["conversation_id"] = conversation_id
         return _OpenAiRequest(size=json_size(body), details=details)
 
+    def _should_emit(self, exc: BaseException | None) -> bool:
+        return not self._abandoned_only or _is_abandonment(exc)
+
     async def get_response(
         self,
         system_instructions: str | None,
@@ -1130,14 +1209,22 @@ class RequestLoggingModel(Model):
         prompt: ResponsePromptParam | None,
     ) -> ModelResponse:
         started, started_mono = datetime.now(UTC), time.monotonic()
-        request = self._request(
-            system_instructions,
-            input,
-            model_settings,
-            tools,
-            previous_response_id=previous_response_id,
-            conversation_id=conversation_id,
-        )
+
+        def request() -> _OpenAiRequest:
+            return self._request(
+                system_instructions,
+                input,
+                model_settings,
+                tools,
+                previous_response_id=previous_response_id,
+                conversation_id=conversation_id,
+            )
+
+        # The LiteLLM route serializes the request only for the rare abandoned
+        # attempt; the native route sizes it before the SDK sees it.
+        eager = None if self._abandoned_only else request()
+        reply = HttpReply()
+        token = _http_reply.set(reply)
         try:
             response = await self._inner.get_response(
                 system_instructions,
@@ -1151,30 +1238,34 @@ class RequestLoggingModel(Model):
                 conversation_id=conversation_id,
                 prompt=prompt,
             )
-        except asyncio.CancelledError:
-            raise
         except BaseException as exc:
+            if self._should_emit(exc):
+                emit(
+                    self._event(
+                        started=started,
+                        started_mono=started_mono,
+                        streaming=False,
+                        response=None,
+                        exc=exc,
+                        request=eager or request(),
+                        reply=reply,
+                    )
+                )
+            raise
+        finally:
+            _reset_http_reply(token)
+        if self._should_emit(None):
             emit(
                 self._event(
                     started=started,
                     started_mono=started_mono,
                     streaming=False,
-                    response=None,
-                    exc=exc,
-                    request=request,
+                    response=response,
+                    exc=None,
+                    request=eager or request(),
+                    reply=reply,
                 )
             )
-            raise
-        emit(
-            self._event(
-                started=started,
-                started_mono=started_mono,
-                streaming=False,
-                response=response,
-                exc=None,
-                request=request,
-            )
-        )
         return response
 
     async def stream_response(
@@ -1192,18 +1283,24 @@ class RequestLoggingModel(Model):
         prompt: ResponsePromptParam | None,
     ) -> AsyncIterator[TResponseStreamEvent]:
         started, started_mono = datetime.now(UTC), time.monotonic()
-        request = self._request(
-            system_instructions,
-            input,
-            model_settings,
-            tools,
-            previous_response_id=previous_response_id,
-            conversation_id=conversation_id,
-        )
+
+        def request() -> _OpenAiRequest:
+            return self._request(
+                system_instructions,
+                input,
+                model_settings,
+                tools,
+                previous_response_id=previous_response_id,
+                conversation_id=conversation_id,
+            )
+
+        eager = None if self._abandoned_only else request()
         completed: ModelResponse | None = None
         raw_response: object = None
         first_event_mono: float | None = None
         finish_reason: str | None = None
+        reply = HttpReply()
+        token = _http_reply.set(reply)
         try:
             async for event in self._inner.stream_response(
                 system_instructions,
@@ -1235,34 +1332,59 @@ class RequestLoggingModel(Model):
                     completed = ModelResponse(output=[], usage=usage, response_id=event.response.id)
                     raw_response = event.response
                 yield event
-        except asyncio.CancelledError:
-            raise
         except BaseException as exc:
+            if self._should_emit(exc):
+                emit(
+                    self._event(
+                        started=started,
+                        started_mono=started_mono,
+                        streaming=True,
+                        response=None,
+                        exc=exc,
+                        request=eager or request(),
+                        reply=reply,
+                        first_event_mono=first_event_mono,
+                    )
+                )
+            raise
+        finally:
+            _reset_http_reply(token)
+        if self._should_emit(None):
             emit(
                 self._event(
                     started=started,
                     started_mono=started_mono,
                     streaming=True,
-                    response=None,
-                    exc=exc,
-                    request=request,
+                    response=completed,
+                    exc=None,
+                    request=eager or request(),
+                    reply=reply,
                     first_event_mono=first_event_mono,
+                    finish_reason=finish_reason,
+                    raw_response=raw_response,
                 )
             )
-            raise
-        emit(
-            self._event(
-                started=started,
-                started_mono=started_mono,
-                streaming=True,
-                response=completed,
-                exc=None,
-                request=request,
-                first_event_mono=first_event_mono,
-                finish_reason=finish_reason,
-                raw_response=raw_response,
-            )
-        )
+
+
+def _reset_http_reply(token: Token[HttpReply | None]) -> None:
+    # An async generator finalized by the event loop's shutdown hook runs in a
+    # different context than the one that started it; the token is void there.
+    with contextlib.suppress(ValueError):
+        _http_reply.reset(token)
+
+
+def _is_abandonment(exc: BaseException | None) -> bool:
+    """The caller gave up on the attempt: cancelled (stream idle timeout,
+    shutdown) or closed the stream before it finished."""
+    return isinstance(exc, asyncio.CancelledError | GeneratorExit)
+
+
+def _abandonment_message(exc: BaseException) -> str | None:
+    if isinstance(exc, asyncio.CancelledError):
+        return "attempt cancelled before the reply was consumed (stream idle timeout or shutdown)"
+    if isinstance(exc, GeneratorExit):
+        return "stream closed by the caller before it finished"
+    return None
 
 
 @dataclass(frozen=True)
