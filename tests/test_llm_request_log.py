@@ -447,16 +447,14 @@ def test_response_headers_are_bounded() -> None:
     assert all(len(v) <= request_log.HEADER_VALUE_MAX_CHARS for v in picked.values())
 
 
-def test_details_drop_content_and_the_callers_key_keep_metadata() -> None:
-    details = request_log.sanitize_details(
+def test_details_keep_everything_as_written_and_bound_it() -> None:
+    details = request_log.bound_details(
         {
             "max_tokens": 4096,
             "temperature": 0,
             "thinking": {"type": "enabled", "budget_tokens": 1024},
-            "messages": [{"role": "user", "content": "SECRET PROMPT"}],
             "tools": [{"name": "t", "input_schema": {}}],
-            "api_key": "sk-ant-secret",
-            "extra_headers": {"authorization": "Bearer x"},
+            "extra_headers": {"x-title": "strix"},
             "api_base": "https://gw.example/v1?tenant=abc",
             "usage": {
                 "input_tokens": 10,
@@ -474,6 +472,8 @@ def test_details_drop_content_and_the_callers_key_keep_metadata() -> None:
         "max_tokens": 4096,
         "temperature": 0,
         "thinking": {"type": "enabled", "budget_tokens": 1024},
+        "tools": [{"name": "t"}],
+        "extra_headers": {"x-title": "strix"},
         "api_base": "https://gw.example/v1?tenant=abc",
         "usage": {
             "input_tokens": 10,
@@ -484,16 +484,16 @@ def test_details_drop_content_and_the_callers_key_keep_metadata() -> None:
         "when": "2026-09-19T00:00:00+00:00",
         "nested": {"a": {"b": {"c": {"d": {"e": "…"}}}}},
     }
-    assert request_log.sanitize_details({}) is None
-    assert request_log.sanitize_details("not a mapping") is None
-    assert request_log.sanitize_details({"messages": []}) is None
+    assert request_log.bound_details({}) is None
+    assert request_log.bound_details("not a mapping") is None
+    assert request_log.bound_details({"messages": []}) is None
 
 
 def test_details_are_bounded_by_size_and_name_the_dropped_keys() -> None:
     big = {"small": 1, "huge": ["x" * 200] * 32, "medium": {"k": "y" * 200}}
     request_log.DETAILS_MAX_BYTES, saved = 1024, request_log.DETAILS_MAX_BYTES
     try:
-        details = request_log.sanitize_details(big)
+        details = request_log.bound_details(big)
     finally:
         request_log.DETAILS_MAX_BYTES = saved
     assert details is not None
@@ -504,7 +504,7 @@ def test_details_are_bounded_by_size_and_name_the_dropped_keys() -> None:
 
 
 def test_details_list_and_string_bounds() -> None:
-    details = request_log.sanitize_details(
+    details = request_log.bound_details(
         {"items": list(range(100)), "long": "z" * 1000, "keys": {str(i): i for i in range(100)}}
     )
     assert details is not None
@@ -572,6 +572,8 @@ def test_litellm_success_carries_sizes_finish_reason_headers_and_details() -> No
     assert event.details["request"] == {
         "max_tokens": 4096,
         "temperature": 0,
+        "tools": [{"name": "a"}, {"name": "b"}],
+        "extra_headers": {"authorization": "Bearer x"},
         "message_count": 1,
         "tool_count": 2,
     }
@@ -586,10 +588,8 @@ def test_litellm_success_carries_sizes_finish_reason_headers_and_details() -> No
         "cache_hit": False,
     }
     assert event.time_to_first_token_ms is None
-    assert "sk-ant-secret" not in str(event.to_dict())
     assert "SECRET PROMPT" not in str(event.to_dict())
     assert "SECRET COMPLETION" not in str(event.to_dict())
-    assert "Bearer" not in str(event.to_dict())
 
 
 def test_litellm_request_size_prefers_the_provider_payload_litellm_built() -> None:
@@ -612,14 +612,14 @@ def test_litellm_request_size_accepts_the_serialized_payload_streaming_adapters_
     assert event.request_bytes == len(payload.encode())
 
 
-def test_openrouter_generation_id_beats_the_cloudflare_ray() -> None:
+def test_openrouter_generation_id_is_the_request_id_and_the_cloudflare_ray_is_not() -> None:
     headers = {"cf-ray": "a3f5d8f23fde88dc-PDX", "x-generation-id": "gen-1790127690-M8vfqPTAr"}
     assert request_log.request_id_from_reply(headers) == "gen-1790127690-M8vfqPTAr"
     assert request_log.request_id_from_headers({"cf-ray": "a3f5-PDX"}) is None
-    assert request_log.request_id_from_reply({"cf-ray": "a3f5-PDX"}) == "a3f5-PDX"
+    assert request_log.request_id_from_reply({"cf-ray": "a3f5-PDX"}) is None
 
 
-def test_request_id_in_the_error_body_beats_the_cloudflare_ray() -> None:
+def test_request_id_in_the_error_body_when_the_gateway_strips_the_header() -> None:
     """A gateway that strips ``request-id`` still forwards Anthropic's body."""
     body = '{"type":"error","error":{"type":"not_found_error"},"request_id":"req_body1"}'
     exc = _anthropic_error(404, body, {"cf-ray": "a3f5-PDX", "content-type": "application/json"})
@@ -628,7 +628,7 @@ def test_request_id_in_the_error_body_beats_the_cloudflare_ray() -> None:
     )
     assert event.provider_request_id == "req_body1"
     assert request_log.request_id_from_reply({"cf-ray": "a3f5-PDX"}, body) == "req_body1"
-    assert request_log.request_id_from_reply({"cf-ray": "a3f5-PDX"}, "no id here") == "a3f5-PDX"
+    assert request_log.request_id_from_reply({"cf-ray": "a3f5-PDX"}, "no id here") is None
 
 
 def test_litellm_streaming_time_to_first_token_from_completion_start() -> None:
@@ -733,7 +733,7 @@ def test_litellm_api_error_with_headers_keeps_its_status() -> None:
     assert event.details is not None
     assert event.details["error"]["body"] == {
         "type": "error",
-        "error": {"type": "overloaded_error"},
+        "error": {"type": "overloaded_error", "message": "Overloaded"},
     }
 
 
@@ -750,7 +750,8 @@ def test_litellm_mapped_error_without_a_json_body_has_no_size_but_keeps_its_stat
     )
     assert event.status_code == 502
     assert event.response_bytes is None
-    assert event.provider_request_id == "a3f5-PDX"
+    assert event.provider_request_id is None
+    assert event.response_headers == {"cf-ray": "a3f5-PDX"}
     assert event.details is not None
     assert "body" not in event.details["error"]
 

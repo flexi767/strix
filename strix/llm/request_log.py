@@ -11,10 +11,9 @@ The typed fields are the common ground every provider shares (status, ids,
 timing, sizes, tokens, cost). Everything else a provider or SDK reports about
 the attempt travels free-form: the response headers, and a ``details`` object
 with the request parameters, the full usage object, the SDK's hidden
-parameters and the error body. Content (prompts, completions, tool arguments)
-and the caller's own credentials are left out of both by key name, and every
-string, list and object is bounded. Raw request and response bodies are never
-captured.
+parameters and the error body. Every string, list and object is bounded. Raw
+request and response bodies are never captured: prompts and completions are
+only ever measured for their size.
 
 Sinks are plain callables. The built-in sink writes one log line per event;
 deployments register their own (a database, a queue) with
@@ -113,7 +112,7 @@ class LlmRequestEvent:
     # Every response header the provider sent, name-normalized, values capped.
     response_headers: dict[str, str] | None = None
     # Free-form: request parameters, full usage object, SDK hidden params,
-    # error body ... with content removed and sizes bounded.
+    # error body ... sizes bounded.
     details: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -236,9 +235,6 @@ _REQUEST_ID_HEADERS: tuple[str, ...] = (
     "x-goog-request-id",
     "x-generation-id",
 )
-# The Cloudflare edge id: the only handle a reply carries when the provider
-# sends none of its own, in the header or the body.
-_EDGE_ID_HEADERS: tuple[str, ...] = ("cf-ray",)
 _LITELLM_HEADER_PREFIX = "llm_provider-"
 
 # Anthropic error bodies carry the id even when a gateway strips the header.
@@ -265,11 +261,6 @@ def request_id_from_headers(headers: Mapping[str, Any] | None) -> str | None:
     return _header_value(headers, _REQUEST_ID_HEADERS)
 
 
-def edge_request_id(headers: Mapping[str, Any] | None) -> str | None:
-    """The edge network's id, for replies where nothing better exists."""
-    return _header_value(headers, _EDGE_ID_HEADERS)
-
-
 def request_id_from_text(text: str | None) -> str | None:
     if not text:
         return None
@@ -278,10 +269,8 @@ def request_id_from_text(text: str | None) -> str | None:
 
 
 def request_id_from_reply(headers: Mapping[str, Any] | None, text: str | None = None) -> str | None:
-    """Provider header id, then the id in the error body, then the edge id."""
-    return (
-        request_id_from_headers(headers) or request_id_from_text(text) or edge_request_id(headers)
-    )
+    """Provider header id, then the id in the error body."""
+    return request_id_from_headers(headers) or request_id_from_text(text)
 
 
 # --------------------------------------------------------------------------- #
@@ -293,45 +282,6 @@ FINISH_REASON_MAX_CHARS = 128
 HEADERS_MAX_COUNT = 64
 HEADER_VALUE_MAX_CHARS = 512
 
-# Keys of a request/response structure whose value is content: the prompt, the
-# completion, tool schemas and arguments. ``details`` is metadata about the
-# exchange, never the exchange itself; bodies are measured, never kept.
-_CONTENT_KEYS: frozenset[str] = frozenset(
-    {
-        "messages",
-        "message",
-        "content",
-        "text",
-        "input",
-        "output",
-        "instructions",
-        "system",
-        "prompt",
-        "completion",
-        "choices",
-        "delta",
-        "tool_calls",
-        "function_call",
-        "arguments",
-        "tools",
-        "functions",
-        "thinking_blocks",
-        "reasoning_content",
-        "citations",
-        "image_url",
-        "data",
-        "b64_json",
-        "embedding",
-        "audio",
-        "complete_input_dict",
-        "original_response",
-    }
-)
-# Request parameters that hold the caller's own credential: the key itself and
-# the header block (``extra_headers``) the authorization header travels in.
-_CREDENTIAL_KEYS: frozenset[str] = frozenset(
-    {"api_key", "authorization", "extra_headers", "headers"}
-)
 DETAILS_MAX_BYTES = 16 * 1024
 DETAILS_MAX_DEPTH = 6
 DETAILS_MAX_ITEMS = 32
@@ -362,7 +312,7 @@ def headers_from_response(headers: Mapping[str, Any] | None) -> dict[str, str] |
     return picked or None
 
 
-def _sanitize_value(value: object, depth: int) -> object:  # noqa: PLR0911
+def _bounded_value(value: object, depth: int) -> object:  # noqa: PLR0911
     if value is None or isinstance(value, bool | int | float):
         return value
     if isinstance(value, str):
@@ -372,17 +322,14 @@ def _sanitize_value(value: object, depth: int) -> object:  # noqa: PLR0911
     if depth >= DETAILS_MAX_DEPTH:
         return "…"
     if isinstance(value, BaseModel):
-        return _sanitize_value(value.model_dump(exclude_none=True), depth)
+        return _bounded_value(value.model_dump(exclude_none=True), depth)
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        return _sanitize_value(dataclasses.asdict(value), depth)
+        return _bounded_value(dataclasses.asdict(value), depth)
     if isinstance(value, Mapping):
         out: dict[str, object] = {}
         for raw_key, item in cast("Mapping[object, object]", value).items():
             key = str(raw_key)
-            lowered = key.lower()
-            if lowered in _CONTENT_KEYS or lowered in _CREDENTIAL_KEYS:
-                continue
-            cleaned = _sanitize_value(item, depth + 1)
+            cleaned = _bounded_value(item, depth + 1)
             if cleaned is None or cleaned in ({}, []):
                 continue
             out[key[:DETAILS_MAX_STRING]] = cleaned
@@ -391,19 +338,18 @@ def _sanitize_value(value: object, depth: int) -> object:  # noqa: PLR0911
         return out
     if isinstance(value, Sequence | set | frozenset):
         items = list(cast("Sequence[object]", value))[:DETAILS_MAX_ITEMS]
-        return [_sanitize_value(item, depth + 1) for item in items]
+        return [_bounded_value(item, depth + 1) for item in items]
     return str(value)[:DETAILS_MAX_STRING]
 
 
-def sanitize_details(value: object) -> dict[str, Any] | None:
-    """A bounded, content-free copy of ``value`` (a mapping), or None.
+def bound_details(value: object) -> dict[str, Any] | None:
+    """A bounded copy of ``value`` (a mapping), or None.
 
-    Content keys and the caller's credential keys are dropped by name, strings
-    are capped, nesting, item counts and total size are bounded. When
+    Strings are capped; nesting, item counts and total size are bounded. When
     the copy is still too large the biggest top-level entries go first and
     their names are listed under ``_dropped``.
     """
-    cleaned = _sanitize_value(value, 0)
+    cleaned = _bounded_value(value, 0)
     if not isinstance(cleaned, dict):
         return None
     details = cast("dict[str, Any]", cleaned)
@@ -425,13 +371,13 @@ def sanitize_details(value: object) -> dict[str, Any] | None:
 
 
 def merge_details(*parts: tuple[str, object]) -> dict[str, Any] | None:
-    """``{name: sanitize(value)}`` for every non-empty part, bounded as one object."""
+    """``{name: value}`` for every non-empty part, bounded as one object."""
     merged: dict[str, Any] = {}
     for name, value in parts:
         if value is None:
             continue
         merged[name] = value
-    return sanitize_details(merged)
+    return bound_details(merged)
 
 
 def json_text(value: object) -> str | None:
@@ -1446,9 +1392,9 @@ __all__ = [
     "RequestLoggingModel",
     "api_host",
     "bind_call_context",
+    "bound_details",
     "clean_error_message",
     "current_call_context",
-    "edge_request_id",
     "emit",
     "event_from_litellm",
     "failure_text",
@@ -1462,7 +1408,6 @@ __all__ = [
     "request_id_from_reply",
     "request_id_from_text",
     "reset_call_context",
-    "sanitize_details",
     "set_retry_attempt",
     "unregister_sink",
 ]
