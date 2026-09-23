@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 import uuid
 from collections.abc import Callable
 from functools import cache
@@ -357,6 +358,12 @@ async def spawn_child_agent(
     event_sink: StreamEventSink | None = None,
     hooks: RunHooks[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    if os.environ.get("STRIX_SINGLE_AGENT") == "1":
+        return {
+            "success": False,
+            "error": "Single-agent mode is enforced; perform the work in the root agent.",
+        }
+
     parent_id = parent_ctx.get("agent_id")
     if not isinstance(parent_id, str):
         raise TypeError("Parent agent_id missing from context")
@@ -438,6 +445,9 @@ async def respawn_subagents(
                     md,
                 )
             )
+
+    if candidates and os.environ.get("STRIX_SINGLE_AGENT") == "1":
+        raise RuntimeError("Single-agent mode cannot resume a run with child agents.")
 
     for child_id, name, parent_id, md in candidates:
         try:

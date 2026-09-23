@@ -376,3 +376,10 @@ Strix builds on the incredible work of open-source projects like [LiteLLM](https
 > You alone are responsible for obtaining authorization and complying with the law. Strix is provided "as is" with no warranty or liability for misuse.
 
 </div>
+
+## Single-agent resource policy (fork)
+
+Set `STRIX_SINGLE_AGENT=1` to reject child-agent creation before construction or
+registration. The root must perform the review itself. Resuming a run that would
+restart child agents fails explicitly; start a fresh single-agent run instead.
+The default remains unchanged when this variable is absent.
